@@ -210,14 +210,15 @@ fn split_basket(lines: &[&Line], terms: &BTreeMap<&str, &Terms>) -> Option<Choic
                 .sum()
         };
         let sizes: BTreeMap<&str, i64> = groups.iter().map(|(p, g)| (*p, goods(p, g))).collect();
-        if sizes.iter().any(|(p, g)| *g < terms[p].min_order_cents) {
-            // The smallest group (lowest id on a tie) goes; its items move on.
-            let smallest = sizes
-                .iter()
-                .min_by_key(|(_, g)| **g)
-                .map(|(p, _)| *p)
-                .expect("at least two groups");
-            dissolved.insert(smallest);
+        // Only a group under its own minimum can be dissolved: the smallest of
+        // them (lowest id on a tie) goes, and its items move on.
+        let smallest_short = sizes
+            .iter()
+            .filter(|(p, g)| **g < terms[**p].min_order_cents)
+            .min_by_key(|(_, g)| **g)
+            .map(|(p, _)| *p);
+        if let Some(provider) = smallest_short {
+            dissolved.insert(provider);
             continue;
         }
 
@@ -359,6 +360,47 @@ mod tests {
         assert_eq!(split.groups["B"], vec![2, 3]);
         assert_eq!(split.total_cents, 300);
         assert!(split.missing.is_empty());
+    }
+
+    #[test]
+    fn only_groups_under_their_minimum_are_dissolved() {
+        // Cheapest stores: item 1 in A (100), items 2 and 3 in B (300 each),
+        // item 4 in C (2000). A is the smallest group but has no minimum; B
+        // (600) is under its 1000 minimum. B goes, not A: its items move to A.
+        let prices = |a, b, c| {
+            BTreeMap::from([
+                ("A".to_string(), Some(a)),
+                ("B".to_string(), Some(b)),
+                ("C".to_string(), Some(c)),
+            ])
+        };
+        let mk = |item, a, b, c| Line {
+            item,
+            product: format!("p{item}"),
+            qty: 1.0,
+            fixed_provider: None,
+            prices: prices(a, b, c),
+        };
+        let lines = vec![
+            mk(1, 100, 500, 800),
+            mk(2, 400, 300, 900),
+            mk(3, 400, 300, 900),
+            mk(4, 2500, 2500, 2000),
+        ];
+        let mut t = terms(0, 0, 1000, 0);
+        t.push(Terms {
+            provider: "C".into(),
+            min_order_cents: 0,
+            fee_cents: 0,
+        });
+        let o = compute(&lines, &t, 0.0);
+        let split = o.split.as_ref().expect("split");
+        assert!(!split.groups.contains_key("B"));
+        assert_eq!(split.groups["A"], vec![1, 2, 3]);
+        assert_eq!(split.groups["C"], vec![4]);
+        assert_eq!(split.total_cents, 100 + 400 + 400 + 2000);
+        assert!(split.missing.is_empty());
+        assert!(split.valid);
     }
 
     #[test]
