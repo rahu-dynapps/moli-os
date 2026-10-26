@@ -240,9 +240,6 @@ struct SaveProductArgs {
     /// The chains' sheets for this product (you cannot confirm them).
     #[serde(default)]
     offers: Vec<OfferArg>,
-    #[serde(flatten)]
-    #[allow(dead_code)] // accepted for uniformity: nothing records who saves a product
-    who: Who,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -701,7 +698,7 @@ impl MoliMcp {
     }
 
     #[tool(
-        description = "Create or change a product and, with it, the sheets (one per chain: reference, label, pack size) where it is sold. A sheet you create stays `pending` until a human confirms it in the dashboard: you can never confirm one, and a sheet you re-save keeps its status. Returns the product's sheets with their ids."
+        description = "Create or change a product and, with it, the sheets (one per chain: reference, label, pack size) where it is sold. A sheet you create stays `pending` until a human confirms it in the dashboard: you can never confirm one, and re-saving a confirmed sheet with a different label, EAN, pack size or unit sends it back to `pending` (the same data keeps its status). No author is recorded, so there is no `actor`. Returns the product's sheets with their ids."
     )]
     async fn pantry_save_product(
         &self,
@@ -837,7 +834,7 @@ impl MoliMcp {
     }
 
     #[tool(
-        description = "Record what was bought, from an order confirmation (source `drive`, status `provisional`) or a receipt (source `ticket`, status `confirmed`). Amounts are unit prices in cents. With `confirm: true` (and the `basket`), at the pick-up, the basket's provisional lines are replaced by `lines`, the corrected ones. You record what a human paid; a basket is never paid by an agent."
+        description = "Record what was bought, from an order confirmation (source `drive`, status `provisional`) or a receipt (source `ticket`, status `confirmed`). Amounts are unit prices in cents. With `confirm: true` (and the `basket`), at the pick-up, the basket's provisional lines are replaced by `lines`, the corrected ones. You record what a human paid; a basket is never paid by an agent. No author is recorded, so there is no `actor`."
     )]
     async fn pantry_record_purchases(
         &self,

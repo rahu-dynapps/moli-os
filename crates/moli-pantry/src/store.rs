@@ -420,9 +420,11 @@ impl Store {
     }
 
     /// Creates a sheet, or updates the one with the same product, chain and
-    /// reference. A new sheet starts `Pending` and an update keeps the current
-    /// status (the `status` field is ignored): only [`Store::confirm_offer`]
-    /// confirms, so a human check can never be skipped or silently undone.
+    /// reference. A new sheet starts `Pending` (the `status` field is
+    /// ignored): only [`Store::confirm_offer`] confirms. An update that leaves
+    /// the label, EAN, pack size and unit as they were keeps the status; one
+    /// that changes any of them sends the sheet back to `Pending`, because the
+    /// human checked what was described, not what it now says.
     pub fn save_offer(&self, o: &Offer) -> Result<i64, PantryError> {
         if o.product.trim().is_empty()
             || o.provider.trim().is_empty()
@@ -436,8 +438,18 @@ impl Store {
         Ok(conn.query_row(
             "INSERT INTO offers(product, provider, reference, label, ean, unit_qty, unit)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(product, provider, reference) DO UPDATE SET label = excluded.label,
-                 ean = excluded.ean, unit_qty = excluded.unit_qty, unit = excluded.unit
+             ON CONFLICT(product, provider, reference) DO UPDATE SET
+                 status = CASE WHEN label IS excluded.label AND ean IS excluded.ean
+                     AND unit_qty IS excluded.unit_qty AND unit IS excluded.unit
+                     THEN status ELSE 'pending' END,
+                 confirmed_by = CASE WHEN label IS excluded.label AND ean IS excluded.ean
+                     AND unit_qty IS excluded.unit_qty AND unit IS excluded.unit
+                     THEN confirmed_by ELSE NULL END,
+                 confirmed_at = CASE WHEN label IS excluded.label AND ean IS excluded.ean
+                     AND unit_qty IS excluded.unit_qty AND unit IS excluded.unit
+                     THEN confirmed_at ELSE NULL END,
+                 label = excluded.label, ean = excluded.ean,
+                 unit_qty = excluded.unit_qty, unit = excluded.unit
              RETURNING id",
             params![
                 o.product,
@@ -873,6 +885,13 @@ mod tests {
         let mut o = offer("lait", "carrefour", "L1");
         let id = store.save_offer(&o).unwrap();
         store.confirm_offer(id, "Sam").unwrap();
+        // Same data again: the human's check still stands.
+        assert_eq!(store.save_offer(&o).unwrap(), id);
+        assert_eq!(
+            store.offers(None).unwrap()[0].status,
+            OfferStatus::Confirmed
+        );
+        // Different data: what was checked is not what is described now.
         o.label = "Lait 1 L".into();
         o.ean = Some("3000000000000".into());
         o.unit_qty = Some(1.0);
@@ -883,8 +902,7 @@ mod tests {
         assert_eq!(all[0].label, "Lait 1 L");
         assert_eq!(all[0].ean.as_deref(), Some("3000000000000"));
         assert_eq!(all[0].unit_qty, Some(1.0));
-        // An update never unconfirms a sheet a human validated.
-        assert_eq!(all[0].status, OfferStatus::Confirmed);
+        assert_eq!(all[0].status, OfferStatus::Pending);
         // Another reference of the same product and chain is a new candidate.
         let other = store.save_offer(&offer("lait", "carrefour", "L2")).unwrap();
         assert_ne!(other, id);
@@ -898,6 +916,39 @@ mod tests {
             store.save_offer(&offer("lait", "carrefour", " ")),
             Err(PantryError::Invalid(_))
         ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn changing_a_confirmed_offer_sends_it_back_to_pending() {
+        let (store, dir) = store("offer-reset");
+        let mut o = offer("lait", "carrefour", "L1");
+        o.unit_qty = Some(1.0);
+        let id = store.save_offer(&o).unwrap();
+        store.confirm_offer(id, "Sam").unwrap();
+        let checked = |store: &Store| -> (OfferStatus, Option<String>, Option<i64>) {
+            let status = store.offers(None).unwrap()[0].status;
+            let (by, at) = store
+                .lock()
+                .query_row(
+                    "SELECT confirmed_by, confirmed_at FROM offers WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            (status, by, at)
+        };
+        // The same data, saved again: still confirmed, by the same person.
+        store.save_offer(&o).unwrap();
+        let (status, by, at) = checked(&store);
+        assert_eq!(status, OfferStatus::Confirmed);
+        assert_eq!(by.as_deref(), Some("Sam"));
+        assert!(at.is_some());
+        // A different pack size: back to pending, nobody has checked it.
+        o.unit_qty = Some(2.0);
+        store.save_offer(&o).unwrap();
+        assert_eq!(checked(&store), (OfferStatus::Pending, None, None));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

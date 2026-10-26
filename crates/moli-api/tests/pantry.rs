@@ -314,20 +314,16 @@ async fn products_baskets_and_errors() {
 
 /// One MCP tool call: whether it failed, and what it said (parsed when JSON).
 async fn tool(addr: &str, name: &str, arguments: &Json) -> (bool, Json) {
-    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+    let rpc = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
         "name": name, "arguments": arguments
     }});
     let accept = "Accept: application/json, text/event-stream\r\n";
-    let (status, answer) = call_with(addr, "/mcp", &call, accept).await;
+    let (status, answer) = call(addr, "POST", "/mcp", &rpc, accept).await;
     assert_eq!(status, 200, "{answer}");
     let result = &answer["result"];
     let text = result["content"][0]["text"].as_str().unwrap_or_default();
     let said = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
     (result["isError"] == true, said)
-}
-
-async fn call_with(addr: &str, path: &str, body: &Json, extra: &str) -> (u16, Json) {
-    call(addr, "POST", path, body, extra).await
 }
 
 /// The two drives set, then a product with two sheets proposed by an agent:
@@ -352,8 +348,6 @@ async fn shelf(addr: &str) -> Vec<i64> {
         addr,
         "pantry_save_product",
         &json!({
-            "actor": "agent-test",
-            "on_behalf_of": "Élodie",
             "product": { "id": "lait", "name": "Lait demi-écrémé" },
             "offers": [
                 { "provider": "carrefour", "reference": "C1", "label": "Lait C" },
@@ -516,5 +510,34 @@ async fn mcp_pantry_edge_cases() {
     let (addr, dir) = house("mcp-demo", true, true).await;
     let (failed, _) = tool(&addr, "pantry_add_item", &json!({ "text": "pain" })).await;
     assert!(failed);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn mcp_resaving_a_changed_sheet_needs_a_new_check() {
+    let (addr, dir) = house("mcp-resave", true, false).await;
+    let ids = shelf(&addr).await;
+    // A human confirms the sheet.
+    let path = format!("/api/cellier/offers/{}/confirm", ids[0]);
+    let (status, body) = call(&addr, "POST", &path, &Json::Null, "").await;
+    assert_eq!(status, 204, "{body}");
+    let resave = |label: &'static str| {
+        json!({
+            "product": { "id": "lait", "name": "Lait demi-écrémé" },
+            "offers": [{ "provider": "carrefour", "reference": "C1", "label": label }],
+        })
+    };
+    let status_of = |said: &Json| {
+        let mut sheet = said["offers"].as_array().unwrap().iter();
+        sheet.find(|o| o["id"] == ids[0]).unwrap()["status"].clone()
+    };
+    // Same data: the human's check stands.
+    let (failed, said) = tool(&addr, "pantry_save_product", &resave("Lait C")).await;
+    assert!(!failed, "{said}");
+    assert_eq!(status_of(&said), "confirmed", "{said}");
+    // Another label: it must be checked again.
+    let (failed, said) = tool(&addr, "pantry_save_product", &resave("Lait entier C")).await;
+    assert!(!failed, "{said}");
+    assert_eq!(status_of(&said), "pending", "{said}");
     let _ = std::fs::remove_dir_all(dir);
 }
