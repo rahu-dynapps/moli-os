@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS baskets (
     chosen     TEXT,
     accepted   TEXT NOT NULL DEFAULT '[]',   -- JSON
     chosen_by  TEXT,
-    chosen_at  INTEGER
+    chosen_at  INTEGER,
+    used       TEXT NOT NULL DEFAULT '[]'    -- JSON: [item, provider, offer] priced in the options
 );
 -- How many times a deviation of a kind was refused for a product.
 CREATE TABLE IF NOT EXISTS refusals (
@@ -142,18 +143,18 @@ impl std::fmt::Debug for Store {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn ts(ms: u64) -> i64 {
+pub(crate) fn ts(ms: u64) -> i64 {
     i64::try_from(ms).unwrap_or(i64::MAX)
 }
 
 #[allow(clippy::cast_sign_loss)]
-fn ms(ts: i64) -> u64 {
+pub(crate) fn ms(ts: i64) -> u64 {
     ts.max(0) as u64
 }
 
@@ -225,6 +226,31 @@ fn check_qty(qty: f64) -> Result<(), PantryError> {
     }
 }
 
+/// Confirms a sheet inside a transaction already open (see [`Store::confirm_offer`]).
+pub(crate) fn confirm_offer_in(conn: &Connection, id: i64, by: &str) -> Result<(), PantryError> {
+    let key: Option<(String, String)> = conn
+        .query_row(
+            "SELECT product, provider FROM offers WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((product, provider)) = key else {
+        return Err(PantryError::NotFound(format!("offer {id}")));
+    };
+    conn.execute(
+        "UPDATE offers SET status = 'pending', confirmed_by = NULL, confirmed_at = NULL
+         WHERE product = ?1 AND provider = ?2 AND id <> ?3",
+        params![product, provider, id],
+    )?;
+    conn.execute(
+        "UPDATE offers SET status = 'confirmed', confirmed_by = ?2, confirmed_at = ?3
+         WHERE id = ?1",
+        params![id, by, ts(now_ms())],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self, PantryError> {
         if let Some(dir) = path.parent() {
@@ -243,7 +269,7 @@ impl Store {
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -428,26 +454,7 @@ impl Store {
     pub fn confirm_offer(&self, id: i64, by: &str) -> Result<(), PantryError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        let key: Option<(String, String)> = tx
-            .query_row(
-                "SELECT product, provider FROM offers WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((product, provider)) = key else {
-            return Err(PantryError::NotFound(format!("offer {id}")));
-        };
-        tx.execute(
-            "UPDATE offers SET status = 'pending', confirmed_by = NULL, confirmed_at = NULL
-             WHERE product = ?1 AND provider = ?2 AND id <> ?3",
-            params![product, provider, id],
-        )?;
-        tx.execute(
-            "UPDATE offers SET status = 'confirmed', confirmed_by = ?2, confirmed_at = ?3
-             WHERE id = ?1",
-            params![id, by, ts(now_ms())],
-        )?;
+        confirm_offer_in(&tx, id, by)?;
         tx.commit()?;
         Ok(())
     }

@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::basket::BasketOptions;
+
 /// How far a product may be swapped for another when a drive lacks it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,4 +164,96 @@ pub struct ProviderSettings {
     pub min_order_cents: i64,
     #[serde(default)]
     pub fee_cents: i64,
+}
+
+/// A way the proposed basket departs from the list as written (a promo pack, a
+/// substitute…), which the household accepts or refuses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deviation {
+    /// Product id.
+    pub product: String,
+    /// `promo_pack`, `out_of_stock`, `own_brand`, `bigger_size`… A kind refused
+    /// twice for a product is not proposed again.
+    pub kind: String,
+    pub text: String,
+    pub gain_cents: i64,
+}
+
+/// Where a basket stands, from the proposal to the pick-up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BasketStatus {
+    /// Options computed, nobody chose yet.
+    Proposed,
+    /// A human chose an option.
+    Chosen,
+    /// The drive carts are filled, waiting for the human to pay.
+    Filled,
+    /// The human ordered.
+    Ordered,
+    /// Collected and settled.
+    Done,
+    /// Given up.
+    Dropped,
+}
+
+impl BasketStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Chosen => "chosen",
+            Self::Filled => "filled",
+            Self::Ordered => "ordered",
+            Self::Done => "done",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "proposed" => Some(Self::Proposed),
+            "chosen" => Some(Self::Chosen),
+            "filled" => Some(Self::Filled),
+            "ordered" => Some(Self::Ordered),
+            "done" => Some(Self::Done),
+            "dropped" => Some(Self::Dropped),
+            _ => None,
+        }
+    }
+}
+
+/// One shopping run: the options computed from the list, what was chosen.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Basket {
+    pub id: i64,
+    pub created_at: u64,
+    pub created_by: String,
+    pub status: BasketStatus,
+    pub options: BasketOptions,
+    pub deviations: Vec<Deviation>,
+    /// Key of the chosen option (a store id, or `split`).
+    pub chosen: Option<String>,
+    /// Indexes (in `deviations`) of the deviations the household accepted.
+    pub accepted: Vec<usize>,
+    pub chosen_by: Option<String>,
+}
+
+/// A line bought. Never paid by the agent: the human pays, the line is recorded
+/// from the order confirmation (`drive`) or the receipt (`ticket`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Purchase {
+    /// Product id.
+    pub product: String,
+    pub provider: String,
+    pub store: String,
+    pub qty: f64,
+    /// Unit price paid, in cents.
+    pub price_cents: i64,
+    pub at: u64,
+    /// `drive` or `ticket`.
+    pub source: String,
+    #[serde(default)]
+    pub basket: Option<i64>,
+    /// `provisional` at the order, `confirmed` once collected (or from a receipt).
+    pub status: String,
 }

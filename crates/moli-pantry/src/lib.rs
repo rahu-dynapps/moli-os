@@ -7,14 +7,15 @@
 //! storage and the pure logic; it opens nothing until the host asks for it.
 
 mod basket;
+mod baskets;
 mod model;
 mod providers;
 mod store;
 
 pub use basket::{BasketOptions, Choice, Line, Terms, compute};
 pub use model::{
-    Flexibility, Item, Offer, OfferStatus, Product, ProviderInfo, ProviderKind, ProviderSettings,
-    Reading,
+    Basket, BasketStatus, Deviation, Flexibility, Item, Offer, OfferStatus, Product, ProviderInfo,
+    ProviderKind, ProviderSettings, Purchase, Reading,
 };
 pub use providers::PROVIDERS;
 pub use store::{PantryError, Store};
