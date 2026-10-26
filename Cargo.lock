@@ -1530,6 +1530,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "moli-pantry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "moli-runtime",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "moli-philips"
 version = "0.1.0"
 dependencies = [
