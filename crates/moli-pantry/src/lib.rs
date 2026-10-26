@@ -2,15 +2,32 @@
 //! made of, and the price comparison of grocery drives.
 //!
 //! Humans (dashboard) and AI agents (MCP) work on the same list. Everything
-//! lives in one SQLite file; amounts are `i64` cents and times are `u64`
-//! milliseconds since the epoch, like `moli-history`. This crate holds the
-//! storage and the pure logic; it opens nothing until the host asks for it.
+//! lives in one SQLite file (`pantry.db` in the data folder, saved by
+//! `moli-os backup`); amounts are `i64` cents and times are `u64`
+//! milliseconds since the epoch, like `moli-history`.
+//!
+//! - [`Store`] holds the storage and the pure logic, synchronous.
+//! - [`Pantry`] is the handle the surfaces (REST, MCP) use: every store
+//!   method, async, on a blocking thread; each successful write announces
+//!   `Event::PantryChanged` on the hub, so the dashboards re-read.
+//! - Who did what is kept in the pantry's own rows (`added_by`,
+//!   `confirmed_by`, `chosen_by`, `read_by`), not in the hub's journal, which
+//!   speaks of devices.
+//! - Dormant by default: only a `[pantry]` section in `moli.toml` opens it,
+//!   and never in the demo house. Nothing runs in the background.
 
 mod basket;
 mod baskets;
 mod model;
 mod providers;
 mod store;
+
+use std::path::Path;
+use std::sync::Arc;
+
+use moli_runtime::Hub;
+use serde::Deserialize;
+use serde_json::json;
 
 pub use basket::{BasketOptions, Choice, Line, Terms, compute};
 pub use model::{
@@ -19,3 +36,289 @@ pub use model::{
 };
 pub use providers::PROVIDERS;
 pub use store::{PantryError, Store};
+
+/// The database's file in the data folder.
+pub const FILE: &str = "pantry.db";
+
+/// The `[pantry]` section of `moli.toml`. Empty for now: its presence alone
+/// switches the pantry on.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {}
+
+/// Cheap handle used by the surfaces: the store, and the hub it announces
+/// its changes on.
+#[derive(Clone, Debug)]
+pub struct Pantry {
+    store: Arc<Store>,
+    hub: Hub,
+}
+
+impl Pantry {
+    /// Opens (or creates) `data_dir/pantry.db`.
+    pub fn open(hub: &Hub, data_dir: &Path) -> Result<Self, PantryError> {
+        Ok(Self {
+            store: Arc::new(Store::open(&data_dir.join(FILE))?),
+            hub: hub.clone(),
+        })
+    }
+
+    /// Everything a dashboard or an agent needs at once: the open list, the
+    /// products, their sheets, each chain with its settings, the split
+    /// threshold and the open basket (or `null`), read in one go. `now` (ms)
+    /// is the time the overview is taken at; nothing in it depends on the
+    /// time yet.
+    pub async fn overview(&self, _now: u64) -> Result<serde_json::Value, PantryError> {
+        self.read(|s| {
+            let providers: Vec<serde_json::Value> = PROVIDERS
+                .iter()
+                .zip(s.provider_settings()?)
+                .map(|(info, settings)| json!({ "info": info, "settings": settings }))
+                .collect();
+            Ok(json!({
+                "items": s.open_items()?,
+                "products": s.products()?,
+                "offers": s.offers(None)?,
+                "providers": providers,
+                "threshold": s.split_threshold()?,
+                "basket": s.open_basket()?,
+            }))
+        })
+        .await
+    }
+
+    // ---- the list and the products -------------------------------------------
+
+    pub async fn add_item(
+        &self,
+        text: &str,
+        product: Option<&str>,
+        qty: f64,
+        by: &str,
+        channel: &str,
+    ) -> Result<Item, PantryError> {
+        let (text, product) = (text.to_owned(), product.map(str::to_owned));
+        let (by, channel) = (by.to_owned(), channel.to_owned());
+        self.write(move |s| s.add_item(&text, product.as_deref(), qty, &by, &channel))
+            .await
+    }
+
+    pub async fn remove_item(&self, id: i64, by: &str) -> Result<(), PantryError> {
+        let by = by.to_owned();
+        self.write(move |s| s.remove_item(id, &by)).await
+    }
+
+    pub async fn set_qty(&self, id: i64, qty: f64) -> Result<Item, PantryError> {
+        self.write(move |s| s.set_qty(id, qty)).await
+    }
+
+    pub async fn open_items(&self) -> Result<Vec<Item>, PantryError> {
+        self.read(Store::open_items).await
+    }
+
+    pub async fn save_product(&self, p: &Product) -> Result<(), PantryError> {
+        let p = p.clone();
+        self.write(move |s| s.save_product(&p)).await
+    }
+
+    pub async fn products(&self) -> Result<Vec<Product>, PantryError> {
+        self.read(Store::products).await
+    }
+
+    // ---- sheets, prices, chains, threshold -----------------------------------
+
+    pub async fn save_offer(&self, o: &Offer) -> Result<i64, PantryError> {
+        let o = o.clone();
+        self.write(move |s| s.save_offer(&o)).await
+    }
+
+    pub async fn confirm_offer(&self, id: i64, by: &str) -> Result<(), PantryError> {
+        let by = by.to_owned();
+        self.write(move |s| s.confirm_offer(id, &by)).await
+    }
+
+    pub async fn offers(&self, product: Option<&str>) -> Result<Vec<Offer>, PantryError> {
+        let product = product.map(str::to_owned);
+        self.read(move |s| s.offers(product.as_deref())).await
+    }
+
+    pub async fn record_readings(&self, readings: &[Reading]) -> Result<(), PantryError> {
+        let readings = readings.to_vec();
+        self.write(move |s| s.record_readings(&readings)).await
+    }
+
+    pub async fn latest_readings(&self, newer_than: u64) -> Result<Vec<Reading>, PantryError> {
+        self.read(move |s| s.latest_readings(newer_than)).await
+    }
+
+    pub async fn provider_settings(&self) -> Result<Vec<ProviderSettings>, PantryError> {
+        self.read(Store::provider_settings).await
+    }
+
+    pub async fn save_provider_settings(
+        &self,
+        settings: &ProviderSettings,
+    ) -> Result<(), PantryError> {
+        let settings = settings.clone();
+        self.write(move |s| s.save_provider_settings(&settings))
+            .await
+    }
+
+    pub async fn split_threshold(&self) -> Result<f64, PantryError> {
+        self.read(Store::split_threshold).await
+    }
+
+    pub async fn set_split_threshold(&self, v: f64) -> Result<(), PantryError> {
+        self.write(move |s| s.set_split_threshold(v)).await
+    }
+
+    // ---- baskets and purchases -----------------------------------------------
+
+    pub async fn propose(
+        &self,
+        by: &str,
+        deviations: Vec<Deviation>,
+        now: u64,
+    ) -> Result<Basket, PantryError> {
+        let by = by.to_owned();
+        self.write(move |s| s.propose(&by, deviations, now)).await
+    }
+
+    pub async fn choose(
+        &self,
+        basket: i64,
+        option: &str,
+        accepted: &[usize],
+        by: &str,
+    ) -> Result<Basket, PantryError> {
+        let (option, accepted, by) = (option.to_owned(), accepted.to_vec(), by.to_owned());
+        self.write(move |s| s.choose(basket, &option, &accepted, &by))
+            .await
+    }
+
+    pub async fn set_status(
+        &self,
+        basket: i64,
+        status: BasketStatus,
+        by: &str,
+    ) -> Result<Basket, PantryError> {
+        let by = by.to_owned();
+        self.write(move |s| s.set_status(basket, status, &by)).await
+    }
+
+    pub async fn record_purchases(&self, p: &[Purchase]) -> Result<(), PantryError> {
+        let p = p.to_vec();
+        self.write(move |s| s.record_purchases(&p)).await
+    }
+
+    pub async fn confirm_purchases(
+        &self,
+        basket: i64,
+        corrected: &[Purchase],
+    ) -> Result<(), PantryError> {
+        let corrected = corrected.to_vec();
+        self.write(move |s| s.confirm_purchases(basket, &corrected))
+            .await
+    }
+
+    pub async fn purchases(&self, from: u64, to: u64) -> Result<Vec<Purchase>, PantryError> {
+        self.read(move |s| s.purchases(from, to)).await
+    }
+
+    pub async fn open_basket(&self) -> Result<Option<Basket>, PantryError> {
+        self.read(Store::open_basket).await
+    }
+
+    // ---- internals -----------------------------------------------------------
+
+    /// Runs `f` on a blocking thread (SQLite is synchronous).
+    async fn read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Store) -> Result<T, PantryError> + Send + 'static,
+    ) -> Result<T, PantryError> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || f(&store))
+            .await
+            .map_err(|e| PantryError::Internal(e.to_string()))?
+    }
+
+    /// Like [`Pantry::read`], then announces the change once it succeeded.
+    async fn write<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Store) -> Result<T, PantryError> + Send + 'static,
+    ) -> Result<T, PantryError> {
+        let done = self.read(f).await?;
+        self.hub.pantry_changed();
+        Ok(done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use moli_core::Event;
+    use moli_runtime::{Hub, HubOptions};
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::*;
+
+    fn pantry(name: &str) -> (Pantry, Hub, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("moli-pantry-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hub = Hub::new(HubOptions::default()).unwrap();
+        let pantry = Pantry::open(&hub, &dir).unwrap();
+        assert!(dir.join("pantry.db").exists());
+        (pantry, hub, dir)
+    }
+
+    #[tokio::test]
+    async fn writes_announce_a_change() {
+        let (pantry, hub, dir) = pantry("announce");
+        let mut events = hub.subscribe();
+        pantry.open_items().await.unwrap();
+        assert_eq!(
+            events.try_recv(),
+            Err(TryRecvError::Empty),
+            "a read announces nothing"
+        );
+        assert!(
+            pantry.add_item("  ", None, 1.0, "Sam", "ui").await.is_err(),
+            "an item needs a text"
+        );
+        assert_eq!(
+            events.try_recv(),
+            Err(TryRecvError::Empty),
+            "a refused write announces nothing"
+        );
+        pantry
+            .add_item("couches", None, 1.0, "Élodie", "ui")
+            .await
+            .unwrap();
+        assert_eq!(events.recv().await.unwrap(), Event::PantryChanged);
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty), "once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_overview_shows_the_whole_cellier() {
+        let (pantry, _hub, dir) = pantry("overview");
+        pantry
+            .add_item("couches", None, 2.0, "Élodie", "ui")
+            .await
+            .unwrap();
+        let view = pantry.overview(0).await.unwrap();
+        assert_eq!(view["items"][0]["text"], "couches");
+        assert_eq!(view["products"], serde_json::json!([]));
+        assert_eq!(view["offers"], serde_json::json!([]));
+        let providers = view["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), PROVIDERS.len());
+        assert_eq!(providers[0]["info"]["id"], PROVIDERS[0].id);
+        assert_eq!(providers[0]["settings"]["id"], PROVIDERS[0].id);
+        assert_eq!(view["threshold"], 0.3);
+        assert!(view["basket"].is_null(), "no basket yet");
+
+        let basket = pantry.propose("agent", Vec::new(), 0).await.unwrap();
+        let view = pantry.overview(0).await.unwrap();
+        assert_eq!(view["basket"]["id"], basket.id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

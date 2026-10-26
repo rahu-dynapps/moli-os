@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 
 /// SQLite databases: copied through SQLite itself.
-const DATABASES: [&str; 2] = ["history.db", "energy.db"];
+const DATABASES: [&str; 3] = ["history.db", "energy.db", "pantry.db"];
 /// Everything else worth keeping (missing ones are skipped).
 const FILES: [&str; 15] = [
     "moli.toml",
@@ -181,6 +181,13 @@ mod tests {
             "PRAGMA journal_mode = WAL; CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (42);",
         )
         .unwrap();
+        let pantry = rusqlite::Connection::open(data.join("pantry.db")).unwrap();
+        pantry
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE items (text TEXT);
+                 INSERT INTO items VALUES ('couches');",
+            )
+            .unwrap();
         std::fs::write(data.join("labels.toml"), "x = 1\n").unwrap();
         std::fs::create_dir_all(data.join("plan")).unwrap();
         std::fs::write(data.join("plan").join("0123456789abcdef.png"), b"png").unwrap();
@@ -195,6 +202,11 @@ mod tests {
         let back = rusqlite::Connection::open(fresh.join("history.db")).unwrap();
         let v: i64 = back.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(v, 42);
+        let cellier = rusqlite::Connection::open(fresh.join("pantry.db")).unwrap();
+        let text: String = cellier
+            .query_row("SELECT text FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(text, "couches", "the pantry comes back too");
         assert_eq!(
             std::fs::read_to_string(fresh.join("labels.toml")).unwrap(),
             "x = 1\n"
@@ -215,7 +227,7 @@ mod tests {
         let other = base.join("other");
         assert!(restore(&other, &saved, false).is_err());
         assert!(!other.join("history.db").exists(), "nothing half-restored");
-        drop((db, back));
+        drop((db, back, pantry, cellier));
         let _ = std::fs::remove_dir_all(base);
     }
 }

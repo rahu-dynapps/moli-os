@@ -329,19 +329,10 @@ async fn serve(config: Config, boot: Instant) -> anyhow::Result<()> {
     // History first: it must be listening before drivers publish anything.
     let (history, recorder) = start_history(&config, &hub, &cancel)?.unzip();
     // Energy too: a reading missed is energy filed in the wrong hour.
-    let (energy, metering) = match &config.energy {
-        Some(energy) => {
-            let (energy, task) = moli_energy::Energy::start(
-                &hub,
-                &config.server.data_dir.join("energy.db"),
-                energy.clone(),
-                cancel.clone(),
-            )
-            .context("cannot open the energy database")?;
-            (Some(energy), Some(task))
-        }
-        None => (None, None),
-    };
+    let (energy, metering) = start_energy(&config, &hub, &cancel)?.unzip();
+    // Opened at start, so a broken database shows in the log at once; no
+    // surface serves it yet.
+    let _pantry = pantry(&config, &hub);
 
     let (mut tasks, gates) = spawn_drivers(&config, &hub, &cancel)?;
     tasks.extend(spawn_house_drivers(&config, &hub, energy.as_ref(), &cancel));
@@ -429,6 +420,18 @@ fn weather(config: &Config) -> Option<moli_weather::Weather> {
     latitude.zip(longitude).map(|(lat, lon)| {
         moli_weather::Weather::new(lat, lon, Some(config.server.data_dir.clone()))
     })
+}
+
+/// The pantry, « Le Cellier »: only with a `[pantry]` section, never in the
+/// demo house. A database that cannot be opened is logged, and the house
+/// starts without it.
+fn pantry(config: &Config, hub: &Hub) -> Option<moli_pantry::Pantry> {
+    if config.pantry.is_none() || config.server.demo {
+        return None;
+    }
+    moli_pantry::Pantry::open(hub, &config.server.data_dir)
+        .inspect_err(|e| tracing::error!(error = %e, "cannot open the pantry, started without it"))
+        .ok()
 }
 
 /// The automations engine, and Moli (who drafts them and writes their
@@ -852,6 +855,25 @@ fn start_history(
     Ok(Some(started))
 }
 
+/// Energy: kWh and € per hour, only with an `[energy]` section.
+fn start_energy(
+    config: &Config,
+    hub: &Hub,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<(moli_energy::Energy, tokio::task::JoinHandle<()>)>> {
+    let Some(energy) = &config.energy else {
+        return Ok(None);
+    };
+    let started = moli_energy::Energy::start(
+        hub,
+        &config.server.data_dir.join("energy.db"),
+        energy.clone(),
+        cancel.clone(),
+    )
+    .context("cannot open the energy database")?;
+    Ok(Some(started))
+}
+
 /// Every driver kind this binary builds (`[[driver]] kind`): what the
 /// catalogue checks packages against, without building anything. A kind
 /// missing here is unknown, whatever `build_driver`'s match says.
@@ -1139,6 +1161,27 @@ mod tests {
             enabled: None,
             options: toml::Value::Table(toml::Table::new()),
         }
+    }
+
+    #[test]
+    fn the_pantry_opens_with_its_section_and_never_in_the_demo() {
+        let dir = std::env::temp_dir().join(format!("moli-pantry-main-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = toml::Value::String(dir.display().to_string());
+        let hub = Hub::new(HubOptions::default()).unwrap();
+        let config = |extra: &str| -> Config {
+            toml::from_str(&format!("[server]\ndata_dir = {data_dir}\n{extra}")).unwrap()
+        };
+        assert!(pantry(&config(""), &hub).is_none(), "no section, no pantry");
+        assert!(!dir.join("pantry.db").exists(), "nothing opened");
+        assert!(
+            pantry(&config("demo = true\n[pantry]\n"), &hub).is_none(),
+            "never in the demo house"
+        );
+        assert!(!dir.join("pantry.db").exists());
+        assert!(pantry(&config("[pantry]\n"), &hub).is_some());
+        assert!(dir.join("pantry.db").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

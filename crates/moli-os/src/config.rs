@@ -54,6 +54,10 @@ pub struct Config {
     /// Automations: the house's position (sunrise, sunset) and time zone.
     #[serde(default)]
     pub automations: moli_automation::Config,
+    /// The pantry, « Le Cellier » (absent: no shopping list). `[pantry]`,
+    /// even empty, switches it on; never in a demo house.
+    #[serde(default)]
+    pub pantry: Option<moli_pantry::Config>,
 }
 
 /// Where and when agents need a human's approval. Edited by humans only:
@@ -352,6 +356,18 @@ mod tests {
         let again = Config::load(&path).unwrap();
         assert_eq!(again.server.data_dir, config.server.data_dir);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_empty_pantry_section_switches_the_pantry_on() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.pantry.is_none(), "absent: no pantry");
+        let config: Config = toml::from_str("[pantry]\n").unwrap();
+        assert!(config.pantry.is_some());
+        assert!(
+            toml::from_str::<Config>("[pantry]\nx = 1\n").is_err(),
+            "an unknown pantry option is refused"
+        );
     }
 
     #[test]

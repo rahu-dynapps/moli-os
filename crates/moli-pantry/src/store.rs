@@ -128,6 +128,9 @@ pub enum PantryError {
     NotFound(String),
     #[error("{0}")]
     Invalid(String),
+    /// A blocking task that did not finish (it panicked).
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 pub struct Store {

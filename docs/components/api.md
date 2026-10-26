@@ -566,6 +566,7 @@ rend sa place.
 | `approval_requested` | `request` : `ApprovalRequest` (`id`, `ts`, `expires`, `point`, `value`, `origin`, `actor?`, `reason`, `device_name`, `native_name`, `rooms`) | un ordre attend un humain |
 | `approval_resolved` | `id`, `decision` : `approved` \| `denied` \| `expired` | décision ou expiration |
 | `notice` | `notice` : `{title?, message, from?, ts}` (`from` = nom de l'automatisme) | message pour la maison (nœud `notify`, canal `maison`) |
+| `pantry_changed` | aucun | le Cellier a changé (liste, produit, prix, panier) : le relire ; jamais envoyé à un invité |
 
 Exemple :
 

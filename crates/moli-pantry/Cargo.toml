@@ -18,6 +18,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+moli-core.workspace = true
 
 [lints]
 workspace = true
