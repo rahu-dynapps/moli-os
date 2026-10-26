@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use moli_core::{DeviceId, Origin, PointId, Value};
 use moli_history::History;
+use moli_pantry::{
+    BasketStatus, Deviation, Offer, Pantry, PantryError, Product, Purchase, Reading,
+};
 use moli_runtime::{CommandError, DeviceView, Hub, LabelPatch};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -22,6 +25,7 @@ pub(crate) fn service(
     bench: Option<std::path::PathBuf>,
     energy: Option<moli_energy::Energy>,
     automations: Option<moli_automation::Automations>,
+    pantry: Option<moli_pantry::Pantry>,
     demo: bool,
 ) -> StreamableHttpService<MoliMcp, LocalSessionManager> {
     // Host validation is done once, for every surface, by `guard`.
@@ -37,6 +41,7 @@ pub(crate) fn service(
                 bench: bench.clone(),
                 energy: energy.clone(),
                 automations: automations.clone(),
+                pantry: pantry.clone(),
                 demo,
             })
         },
@@ -52,6 +57,7 @@ pub(crate) struct MoliMcp {
     bench: Option<std::path::PathBuf>,
     energy: Option<moli_energy::Energy>,
     automations: Option<moli_automation::Automations>,
+    pantry: Option<moli_pantry::Pantry>,
     /// A demo house: what would stay for the next visitors (names, drafts)
     /// is not for anyone to write.
     demo: bool,
@@ -158,6 +164,157 @@ struct JournalArgs {
     /// Maximum number of entries, most recent first (default 20).
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Who acts, for every tool that writes in the pantry.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct Who {
+    /// Who is acting (your agent name). Recorded with what you write.
+    #[serde(default)]
+    actor: Option<String>,
+    /// The household member you act for (a first name), if there is one.
+    #[serde(default)]
+    on_behalf_of: Option<String>,
+}
+
+impl Who {
+    /// `"{actor} (de la part de {on_behalf_of})"`, or the actor alone.
+    fn name(&self) -> String {
+        let actor = self
+            .actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or("agent");
+        match self.on_behalf_of.as_deref().map(str::trim) {
+            Some(person) if !person.is_empty() => format!("{actor} (de la part de {person})"),
+            _ => actor.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AddItemArgs {
+    /// The need, in the household's words (e.g. "couches taille 4").
+    text: String,
+    /// Product id (from pantry_overview) when the need is a known product.
+    #[serde(default)]
+    product: Option<String>,
+    /// Quantity (default 1). Asking again for an open need adds to it.
+    #[serde(default)]
+    qty: Option<f64>,
+    #[serde(flatten)]
+    who: Who,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RemoveItemArgs {
+    /// Item id (from pantry_overview).
+    id: i64,
+    #[serde(flatten)]
+    who: Who,
+}
+
+/// A product as one chain sells it. Always saved as `pending`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OfferArg {
+    /// Chain id: intermarche, carrefour, amazon or nespresso.
+    provider: String,
+    /// The chain's own reference for the product.
+    reference: String,
+    /// The label on the chain's page.
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    ean: Option<String>,
+    /// Quantity in the pack, to compare unit prices.
+    #[serde(default)]
+    unit_qty: Option<f64>,
+    #[serde(default)]
+    unit: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SaveProductArgs {
+    product: Product,
+    /// The chains' sheets for this product (you cannot confirm them).
+    #[serde(default)]
+    offers: Vec<OfferArg>,
+    #[serde(flatten)]
+    #[allow(dead_code)] // accepted for uniformity: nothing records who saves a product
+    who: Who,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReadingArg {
+    /// Offer (sheet) id, from pantry_overview or pantry_save_product.
+    offer: i64,
+    /// The store set for the chain (see `providers` in pantry_overview): read
+    /// the price in that store, not in another.
+    store: String,
+    /// Price in cents.
+    price_cents: i64,
+    /// Unit price (per kg, per litre, per piece...) in cents.
+    #[serde(default)]
+    unit_price_cents: Option<i64>,
+    /// Promotion label, when the price is a special offer.
+    #[serde(default)]
+    promo: Option<String>,
+    /// False when the store has no stock: the product has no price there.
+    available: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RecordPricesArgs {
+    readings: Vec<ReadingArg>,
+    #[serde(flatten)]
+    who: Who,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProposeArgs {
+    /// Ways the basket departs from the list as written (promo pack,
+    /// substitute...). The household accepts or refuses each one.
+    #[serde(default)]
+    deviations: Vec<Deviation>,
+    #[serde(flatten)]
+    who: Who,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ChooseArgs {
+    /// Basket id.
+    basket: i64,
+    /// Key of the option: a store id, or `split`.
+    option: String,
+    /// Indexes of the accepted deviations (default none).
+    #[serde(default)]
+    accepted: Vec<usize>,
+    #[serde(flatten)]
+    who: Who,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BasketStatusArgs {
+    /// Basket id.
+    basket: i64,
+    /// `filled` (the carts are filled), `ordered` (the human ordered) or
+    /// `dropped`.
+    status: String,
+    #[serde(flatten)]
+    who: Who,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PurchasesArgs {
+    /// The basket they belong to (required to confirm).
+    #[serde(default)]
+    basket: Option<i64>,
+    lines: Vec<Purchase>,
+    /// False (default): record the lines. True: at the pick-up, replace the
+    /// basket's provisional lines by these corrected ones.
+    #[serde(default)]
+    confirm: bool,
 }
 
 #[tool_router]
@@ -490,6 +647,233 @@ impl MoliMcp {
             Err(e) => Ok(fail(&e.to_string())),
         }
     }
+
+    #[tool(
+        description = "The whole Cellier (household pantry) at once: the open shopping list, the products, every chain's sheets (with their status, pending or confirmed), each chain with its settings (enabled, the store set for it, minimum order, fee), the split threshold and the open basket with its options."
+    )]
+    async fn pantry_overview(&self) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(false) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        reply(pantry.overview(moli_core::now_ms()).await)
+    }
+
+    #[tool(
+        description = "Add a need to the household shopping list. Asking again for a need that is already open raises its quantity instead of adding a second line."
+    )]
+    async fn pantry_add_item(
+        &self,
+        Parameters(args): Parameters<AddItemArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        reply(
+            pantry
+                .add_item(
+                    &args.text,
+                    args.product.as_deref(),
+                    args.qty.unwrap_or(1.0),
+                    &args.who.name(),
+                    CHANNEL,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Remove a line from the open shopping list.")]
+    async fn pantry_remove_item(
+        &self,
+        Parameters(args): Parameters<RemoveItemArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        reply(
+            pantry
+                .remove_item(args.id, &args.who.name())
+                .await
+                .map(|()| json!({ "ok": true, "id": args.id })),
+        )
+    }
+
+    #[tool(
+        description = "Create or change a product and, with it, the sheets (one per chain: reference, label, pack size) where it is sold. A sheet you create stays `pending` until a human confirms it in the dashboard: you can never confirm one, and a sheet you re-save keeps its status. Returns the product's sheets with their ids."
+    )]
+    async fn pantry_save_product(
+        &self,
+        Parameters(args): Parameters<SaveProductArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        let id = args.product.id.clone();
+        let saved = async {
+            pantry.save_product(&args.product).await?;
+            for offer in args.offers {
+                pantry
+                    .save_offer(&Offer {
+                        product: id.clone(),
+                        provider: offer.provider,
+                        reference: offer.reference,
+                        label: offer.label,
+                        ean: offer.ean,
+                        unit_qty: offer.unit_qty,
+                        unit: offer.unit,
+                        ..Offer::default()
+                    })
+                    .await?;
+            }
+            pantry.offers(Some(&id)).await
+        }
+        .await;
+        reply(saved.map(|offers| json!({ "ok": true, "product": id, "offers": offers })))
+    }
+
+    #[tool(
+        description = "Record prices read on the chains' sites, one reading per sheet and store (read_at is now). Read each price in the store set for the chain (see `providers` in pantry_overview), never in another store. Set `available` to false when the store has no stock. A reading older than 12 hours no longer counts for a basket, so read right before pantry_propose_basket."
+    )]
+    async fn pantry_record_prices(
+        &self,
+        Parameters(args): Parameters<RecordPricesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        if args.readings.is_empty() {
+            return ok(&json!({ "ok": true, "recorded": 0 }));
+        }
+        let (read_at, read_by) = (moli_core::now_ms(), args.who.name());
+        let readings: Vec<Reading> = args
+            .readings
+            .into_iter()
+            .map(|r| Reading {
+                offer: r.offer,
+                store: r.store,
+                price_cents: r.price_cents,
+                unit_price_cents: r.unit_price_cents,
+                promo: r.promo,
+                available: r.available,
+                read_at,
+                read_by: read_by.clone(),
+            })
+            .collect();
+        let count = readings.len();
+        reply(
+            pantry
+                .record_readings(&readings)
+                .await
+                .map(|()| json!({ "ok": true, "recorded": count })),
+        )
+    }
+
+    #[tool(
+        description = "Compare the open shopping list across the enabled drives and propose a basket: one option per store and a split one, with totals and the recommended one (`options.recommended`). Only prices read less than 12 hours ago count; a product without a fresh price is listed apart (`nowhere`). Nothing is bought: the household chooses, and a basket is never paid by an agent."
+    )]
+    async fn pantry_propose_basket(
+        &self,
+        Parameters(args): Parameters<ProposeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        reply(
+            pantry
+                .propose(&args.who.name(), args.deviations, moli_core::now_ms())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Choose an option of a proposed basket (a store id, or `split`), with the indexes of the accepted deviations. It confirms the sheets that option relies on, so only call it once the household has told you which option it wants."
+    )]
+    async fn pantry_choose_option(
+        &self,
+        Parameters(args): Parameters<ChooseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        reply(
+            pantry
+                .choose(args.basket, &args.option, &args.accepted, &args.who.name())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Move a chosen basket on: `filled` once the drive carts are filled, `ordered` once the human has ordered, `dropped` to give up. An agent stops at the filled carts: a basket is never paid by an agent, the human pays."
+    )]
+    async fn pantry_set_basket_status(
+        &self,
+        Parameters(args): Parameters<BasketStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        let status = match args.status.as_str() {
+            "filled" => BasketStatus::Filled,
+            "ordered" => BasketStatus::Ordered,
+            "dropped" => BasketStatus::Dropped,
+            other => {
+                return Ok(fail(&format!(
+                    "status {other:?}: use filled, ordered or dropped"
+                )));
+            }
+        };
+        reply(
+            pantry
+                .set_status(args.basket, status, &args.who.name())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Record what was bought, from an order confirmation (source `drive`, status `provisional`) or a receipt (source `ticket`, status `confirmed`). Amounts are unit prices in cents. With `confirm: true` (and the `basket`), at the pick-up, the basket's provisional lines are replaced by `lines`, the corrected ones. You record what a human paid; a basket is never paid by an agent."
+    )]
+    async fn pantry_record_purchases(
+        &self,
+        Parameters(args): Parameters<PurchasesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pantry = match self.pantry(true) {
+            Ok(p) => p,
+            Err(refused) => return Ok(refused),
+        };
+        let count = args.lines.len();
+        if args.confirm {
+            let Some(basket) = args.basket else {
+                return Ok(fail("basket is required to confirm purchases"));
+            };
+            return reply(
+                pantry
+                    .confirm_purchases(basket, &args.lines)
+                    .await
+                    .map(|()| json!({ "ok": true, "confirmed": count })),
+            );
+        }
+        let lines: Vec<Purchase> = args
+            .lines
+            .into_iter()
+            .map(|l| Purchase {
+                basket: l.basket.or(args.basket),
+                ..l
+            })
+            .collect();
+        reply(
+            pantry
+                .record_purchases(&lines)
+                .await
+                .map(|()| json!({ "ok": true, "recorded": count })),
+        )
+    }
 }
 
 /// Statistics a model can read at a glance, plus the series itself.
@@ -584,6 +968,30 @@ fn compact(view: &DeviceView) -> Json {
         "online": view.online,
         "points": points,
     })
+}
+
+/// Everything done through MCP comes from an agent.
+const CHANNEL: &str = "agent";
+
+impl MoliMcp {
+    /// The pantry, or the reason an agent cannot use it: a demo house keeps
+    /// what would stay for the next visitors, and the brick may be off.
+    fn pantry(&self, write: bool) -> Result<&Pantry, CallToolResult> {
+        if write && self.demo {
+            return Err(fail(&moli_i18n::tr!("serveur.demo.reserve")));
+        }
+        self.pantry
+            .as_ref()
+            .ok_or_else(|| fail("Le Cellier n'est pas activé sur cette instance"))
+    }
+}
+
+/// A pantry result as a tool answer: the JSON, or the store's own words.
+fn reply<T: serde::Serialize>(result: Result<T, PantryError>) -> Result<CallToolResult, McpError> {
+    match result {
+        Ok(value) => ok(&serde_json::to_value(value).unwrap_or_default()),
+        Err(e) => Ok(fail(&e.to_string())),
+    }
 }
 
 #[allow(clippy::unnecessary_wraps)]

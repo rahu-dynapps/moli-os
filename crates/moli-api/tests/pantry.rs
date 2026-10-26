@@ -311,3 +311,210 @@ async fn products_baskets_and_errors() {
     assert_eq!(status, 400, "unknown chain");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// One MCP tool call: whether it failed, and what it said (parsed when JSON).
+async fn tool(addr: &str, name: &str, arguments: &Json) -> (bool, Json) {
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": name, "arguments": arguments
+    }});
+    let accept = "Accept: application/json, text/event-stream\r\n";
+    let (status, answer) = call_with(addr, "/mcp", &call, accept).await;
+    assert_eq!(status, 200, "{answer}");
+    let result = &answer["result"];
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    let said = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
+    (result["isError"] == true, said)
+}
+
+async fn call_with(addr: &str, path: &str, body: &Json, extra: &str) -> (u16, Json) {
+    call(addr, "POST", path, body, extra).await
+}
+
+/// The two drives set, then a product with two sheets proposed by an agent:
+/// the ids of its sheets (all still pending).
+async fn shelf(addr: &str) -> Vec<i64> {
+    // The household sets the two drives and their stores.
+    let (status, body) = call(
+        addr,
+        "PUT",
+        "/api/cellier/settings",
+        &json!({ "providers": [
+            { "id": "carrefour", "enabled": true, "store": "Ville-A" },
+            { "id": "intermarche", "enabled": true, "store": "Ville-B" },
+        ] }),
+        "",
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+
+    // 1. An agent proposes a product with two sheets.
+    let (failed, saved) = tool(
+        addr,
+        "pantry_save_product",
+        &json!({
+            "actor": "agent-test",
+            "on_behalf_of": "Élodie",
+            "product": { "id": "lait", "name": "Lait demi-écrémé" },
+            "offers": [
+                { "provider": "carrefour", "reference": "C1", "label": "Lait C" },
+                { "provider": "intermarche", "reference": "I1", "label": "Lait I",
+                  "status": "confirmed" },
+            ],
+        }),
+    )
+    .await;
+    assert!(!failed, "{saved}");
+    let ids: Vec<i64> = saved["offers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{saved}");
+    let (failed, view) = tool(addr, "pantry_overview", &json!({})).await;
+    assert!(!failed, "{view}");
+    assert!(
+        view["offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["status"] == "pending"),
+        "an agent never confirms a sheet: {view}"
+    );
+    ids
+}
+
+#[tokio::test]
+async fn mcp_pantry_round_trip() {
+    let (addr, dir) = house("mcp", true, false).await;
+    let ids = shelf(&addr).await;
+
+    // 2. Prices, read in the stores set for the chains.
+    let (failed, said) = tool(
+        &addr,
+        "pantry_record_prices",
+        &json!({
+            "actor": "agent-test",
+            "readings": [
+                { "offer": ids[0], "store": "Ville-A", "price_cents": 120, "available": true },
+                { "offer": ids[1], "store": "Ville-B", "price_cents": 100, "available": true },
+            ],
+        }),
+    )
+    .await;
+    assert!(!failed, "{said}");
+
+    // 3. The need.
+    let (failed, item) = tool(
+        &addr,
+        "pantry_add_item",
+        &json!({
+            "actor": "agent-test", "on_behalf_of": "Élodie",
+            "text": "lait", "product": "lait", "qty": 2,
+        }),
+    )
+    .await;
+    assert!(!failed, "{item}");
+    assert_eq!(item["added_by"], "agent-test (de la part de Élodie)");
+    assert_eq!(item["channel"], "agent");
+
+    // 4. The basket.
+    let (failed, basket) = tool(
+        &addr,
+        "pantry_propose_basket",
+        &json!({ "actor": "agent-test" }),
+    )
+    .await;
+    assert!(!failed, "{basket}");
+    assert_eq!(basket["status"], "proposed");
+    assert_eq!(basket["created_by"], "agent-test");
+    assert_eq!(basket["options"]["recommended"], "intermarche", "{basket}");
+
+    // 5. The choice confirms the sheet it relies on.
+    let (failed, chosen) = tool(
+        &addr,
+        "pantry_choose_option",
+        &json!({ "actor": "agent-test", "basket": basket["id"], "option": "intermarche" }),
+    )
+    .await;
+    assert!(!failed, "{chosen}");
+    assert_eq!(chosen["status"], "chosen");
+    let (_, view) = tool(&addr, "pantry_overview", &json!({})).await;
+    let status_of = |id: i64| {
+        view["offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .map(|o| o["status"].clone())
+    };
+    assert_eq!(status_of(ids[1]), Some(json!("confirmed")), "{view}");
+    assert_eq!(status_of(ids[0]), Some(json!("pending")), "{view}");
+
+    // The agent moves the basket on, never to « done »: the human pays.
+    let (failed, said) = tool(
+        &addr,
+        "pantry_set_basket_status",
+        &json!({ "actor": "agent-test", "basket": basket["id"], "status": "done" }),
+    )
+    .await;
+    assert!(failed, "{said}");
+    let (failed, said) = tool(
+        &addr,
+        "pantry_set_basket_status",
+        &json!({ "actor": "agent-test", "basket": basket["id"], "status": "filled" }),
+    )
+    .await;
+    assert!(!failed, "{said}");
+    assert_eq!(said["status"], "filled");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn mcp_pantry_edge_cases() {
+    let (addr, dir) = house("mcp-edges", true, false).await;
+    // No reading: nothing to store, and the store is not even asked.
+    let (failed, said) = tool(&addr, "pantry_record_prices", &json!({ "readings": [] })).await;
+    assert!(!failed, "{said}");
+    // Confirming purchases needs the basket they belong to.
+    let line = json!({
+        "product": "lait", "provider": "carrefour", "store": "Ville-A", "qty": 1,
+        "price_cents": 100, "at": 1, "source": "drive", "status": "provisional",
+    });
+    let (failed, said) = tool(
+        &addr,
+        "pantry_record_purchases",
+        &json!({ "lines": [line], "confirm": true }),
+    )
+    .await;
+    assert!(failed);
+    assert_eq!(said, json!("basket is required to confirm purchases"));
+    // An unknown id is an error the agent can read.
+    let (failed, said) = tool(&addr, "pantry_remove_item", &json!({ "id": 99 })).await;
+    assert!(failed, "{said}");
+    // Without a name the agent is « agent ».
+    let (_, item) = tool(&addr, "pantry_add_item", &json!({ "text": "pain" })).await;
+    assert_eq!(item["added_by"], "agent");
+    let _ = std::fs::remove_dir_all(dir);
+
+    // No [pantry]: every tool says so.
+    let (addr, dir) = house("mcp-absent", false, false).await;
+    for (name, args) in [
+        ("pantry_overview", json!({})),
+        ("pantry_add_item", json!({ "text": "pain" })),
+    ] {
+        let (failed, said) = tool(&addr, name, &args).await;
+        assert!(failed, "{name}");
+        assert_eq!(
+            said,
+            json!("Le Cellier n'est pas activé sur cette instance")
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+
+    // The demo house is read-only for agents too.
+    let (addr, dir) = house("mcp-demo", true, true).await;
+    let (failed, _) = tool(&addr, "pantry_add_item", &json!({ "text": "pain" })).await;
+    assert!(failed);
+    let _ = std::fs::remove_dir_all(dir);
+}

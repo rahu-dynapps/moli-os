@@ -340,6 +340,7 @@ pub fn router(hub: Hub, shutdown: CancellationToken, options: &Options) -> Route
                 options.bench_path.clone(),
                 options.energy.clone(),
                 options.automations.clone(),
+                options.pantry.clone(),
                 options.demo,
             ),
         )

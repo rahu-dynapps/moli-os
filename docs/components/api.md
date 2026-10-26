@@ -622,7 +622,7 @@ exception : `camera_snapshot` renvoie un bloc image (base64 + type MIME).
 Brancher un client : `claude mcp add --transport http moli http://<hôte>:8790/mcp`
 (Claude Code), ou l'équivalent « serveur MCP HTTP » de tout autre agent.
 
-### 4.2 Les 14 outils
+### 4.2 Les 23 outils
 
 | Outil | Paramètres | Renvoie | Notes |
 |---|---|---|---|
@@ -640,10 +640,19 @@ Brancher un client : `claude mcp add --transport http moli http://<hôte>:8790/m
 | `get_automation` | `id` | `{automation, check, runs (5 dernières, étape par étape)}` | `unknown automation` |
 | `save_automation_draft` | `automation` : objet comme `get_automation` le renvoie (`name`, `mode`, `graph` ; `id` pour retravailler un existant ; `id` et `enabled` complétés par défaut) | `{id, status:"draft: a person must approve it in the dashboard", check}` | toujours un **brouillon** d'auteur `agent` ; modifier la logique d'un automatisme validé lui fait perdre sa validation ; ne peut pas allumer |
 | `test_automation` | `id` | `Run` à blanc (chemin suivi, étape par étape) | conditions lues pour de vrai, rien n'agit, rien n'attend |
+| `pantry_overview` | aucun | `{items, products, offers (fiches, `status` pending\|confirmed), providers:[{info, settings}], threshold, basket\|null}` | tout le Cellier d'un coup ; brique absente : `Le Cellier n'est pas activé sur cette instance` |
+| `pantry_add_item` | `text`, `product?`, `qty?` (défaut 1), `actor?`, `on_behalf_of?` | l'article | canal `agent`, auteur `"{actor} (de la part de {on_behalf_of})"` ou `actor` seul (`agent` par défaut) ; redemander un besoin ouvert en augmente la quantité ; refusé en maison démo |
+| `pantry_remove_item` | `id`, `actor?`, `on_behalf_of?` | `{ok, id}` | refusé en maison démo |
+| `pantry_save_product` | `product` (`id`, `name`, `detail?`, `flexibility?`, `fixed_provider?`, `aisle?`), `offers?` (`provider`, `reference`, `label?`, `ean?`, `unit_qty?`, `unit?`) | `{ok, product, offers}` (les fiches du produit, avec leur `id`) | une fiche créée par un agent reste `pending` jusqu'à la confirmation d'un humain ; un agent ne peut jamais confirmer |
+| `pantry_record_prices` | `readings:[{offer, store, price_cents, unit_price_cents?, promo?, available}]`, `actor?`, `on_behalf_of?` | `{ok, recorded}` | `read_at` = maintenant, `read_by` = qui agit ; le prix se relève dans le magasin réglé de l'enseigne ; liste vide : rien n'est écrit ; tout ou rien |
+| `pantry_propose_basket` | `deviations?:[{product, kind, text, gain_cents}]`, `actor?`, `on_behalf_of?` | le panier (`options.recommended`, `singles`, `split`, `nowhere`…) | seuls les relevés de moins de 12 h comptent ; rien n'est acheté |
+| `pantry_choose_option` | `basket`, `option` (id d'un magasin ou `split`), `accepted?` (index d'écarts), `actor?`, `on_behalf_of?` | le panier choisi | confirme les fiches de l'option choisie |
+| `pantry_set_basket_status` | `basket`, `status` (`filled`, `ordered` ou `dropped`), `actor?`, `on_behalf_of?` | le panier | `done` n'existe pas ici : un panier n'est jamais payé par un agent |
+| `pantry_record_purchases` | `basket?`, `lines:[Purchase]`, `confirm?` (défaut faux) | `{ok, recorded}` ou `{ok, confirmed}` | `confirm: true` (au retrait) remplace les lignes provisoires du panier par `lines` ; sans `basket` : `basket is required to confirm purchases` |
 
 Il n'existe volontairement **aucun** outil MCP pour approuver un ordre, valider, allumer,
-lancer pour de vrai, restaurer ou supprimer un automatisme : c'est réservé à l'humain du
-dashboard.
+lancer pour de vrai, restaurer ou supprimer un automatisme, ni pour confirmer une fiche du
+Cellier, ni pour payer un panier : c'est réservé à l'humain du dashboard.
 
 ### 4.3 Règles de `history_sql`
 

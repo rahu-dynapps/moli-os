@@ -1,11 +1,12 @@
 //! Serializable types shared by the store, the REST routes and the MCP tools.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::basket::BasketOptions;
 
 /// How far a product may be swapped for another when a drive lacks it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Flexibility {
     /// Exactly this product, nothing else.
@@ -41,7 +42,7 @@ impl Flexibility {
 }
 
 /// Something the household buys again and again.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Product {
     pub id: String,
     pub name: String,
@@ -168,7 +169,7 @@ pub struct ProviderSettings {
 
 /// A way the proposed basket departs from the list as written (a promo pack, a
 /// substitute…), which the household accepts or refuses.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Deviation {
     /// Product id.
     pub product: String,
@@ -240,7 +241,7 @@ pub struct Basket {
 
 /// A line bought. Never paid by the agent: the human pays, the line is recorded
 /// from the order confirmation (`drive`) or the receipt (`ticket`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Purchase {
     /// Product id.
     pub product: String,
