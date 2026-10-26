@@ -76,5 +76,13 @@ export const setBasketStatus = (basket, status) => write('POST', `/api/cellier/b
 /** Cents as an amount in the house's language (« 12,34 € »). */
 export const euros = (cents) => money(cents / 100);
 
+/** The line is in a drive's cart (a basket filled or ordered), so a new
+ *  request for it makes a new line. Only the open basket's status is known:
+ *  a line tied to it is in a cart once it is filled or ordered (while merely
+ *  chosen, it is not yet); a line tied to another basket is, since an older
+ *  basket still open beside a newer one can only be filled or ordered. */
+export const inCart = (item) =>
+  item.basket != null && !(cellier.basket?.id === item.basket && ['proposed', 'chosen'].includes(cellier.basket.status));
+
 /** A chain's display name from its id. */
 export const providerName = (id) => cellier.providers.find((p) => p.info.id === id)?.info.name ?? id;

@@ -541,3 +541,87 @@ async fn mcp_resaving_a_changed_sheet_needs_a_new_check() {
     assert_eq!(status_of(&said), "pending", "{said}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn mcp_purchases_provisional_then_confirmed_once() {
+    let (addr, dir) = house("mcp-purchases", true, false).await;
+    let ids = shelf(&addr).await;
+    let (failed, said) = tool(
+        &addr,
+        "pantry_record_prices",
+        &json!({ "readings": [
+            { "offer": ids[0], "store": "Ville-A", "price_cents": 120, "available": true },
+        ] }),
+    )
+    .await;
+    assert!(!failed, "{said}");
+    let (failed, item) = tool(
+        &addr,
+        "pantry_add_item",
+        &json!({ "text": "lait", "product": "lait", "qty": 2 }),
+    )
+    .await;
+    assert!(!failed, "{item}");
+    let (_, basket) = tool(&addr, "pantry_propose_basket", &json!({})).await;
+    let id = basket["id"].clone();
+    let (failed, said) = tool(
+        &addr,
+        "pantry_choose_option",
+        &json!({ "basket": id, "option": "carrefour" }),
+    )
+    .await;
+    assert!(!failed, "{said}");
+    for status in ["filled", "ordered"] {
+        let (failed, said) = tool(
+            &addr,
+            "pantry_set_basket_status",
+            &json!({ "basket": id, "status": status }),
+        )
+        .await;
+        assert!(!failed, "{said}");
+    }
+
+    // The order confirmation: provisional lines.
+    let line = |price: i64, status: &str| {
+        json!({
+            "product": "lait", "provider": "carrefour", "store": "Ville-A", "qty": 2,
+            "price_cents": price, "at": 1, "source": "drive", "status": status,
+        })
+    };
+    let (failed, said) = tool(
+        &addr,
+        "pantry_record_purchases",
+        &json!({ "basket": id, "lines": [line(120, "provisional")] }),
+    )
+    .await;
+    assert!(!failed, "{said}");
+    assert_eq!(said["recorded"], 1);
+    let (_, view) = tool(&addr, "pantry_overview", &json!({})).await;
+    assert_eq!(view["basket"]["status"], "ordered", "{view}");
+    assert_eq!(view["items"][0]["basket"], id, "{view}");
+
+    // The pick-up, sent twice (a lost answer): the corrected line, once.
+    for _ in 0..2 {
+        let (failed, said) = tool(
+            &addr,
+            "pantry_record_purchases",
+            &json!({ "basket": id, "lines": [line(115, "confirmed")], "confirm": true }),
+        )
+        .await;
+        assert!(!failed, "{said}");
+        assert_eq!(said["confirmed"], 1);
+    }
+    let (_, view) = tool(&addr, "pantry_overview", &json!({})).await;
+    assert_eq!(view["basket"], Json::Null, "the basket is done: {view}");
+    assert_eq!(view["items"], json!([]), "{view}");
+    let store = moli_pantry::Store::open(&dir.join(moli_pantry::FILE)).unwrap();
+    let bought: Vec<(String, i64, String)> = store
+        .purchases(0, u64::MAX / 4)
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.source, p.price_cents, p.status))
+        .collect();
+    assert_eq!(bought, vec![("drive".into(), 115, "confirmed".into())]);
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}

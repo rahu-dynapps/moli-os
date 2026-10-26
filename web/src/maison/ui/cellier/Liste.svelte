@@ -1,6 +1,6 @@
 <script>
   import Icon from '../Icon.svelte';
-  import { cellier, addItem, setQty, removeItem } from '../../lib/cellier.svelte.js';
+  import { cellier, addItem, setQty, removeItem, inCart } from '../../lib/cellier.svelte.js';
   import { home, note, relative } from '../../lib/home.svelte.js';
   import { t, locale } from '../../../lib/i18n.svelte.js';
 
@@ -71,7 +71,7 @@
       {#each cellier.items as item (item.id)}
         <li>
           <div class="what">
-            <b>{item.text}</b>
+            <b>{item.text}{#if inCart(item)} <small class="chip cool">{t('cellier.liste.en_commande')}</small>{/if}</b>
             <small class="muted" title={item.added_by}>{t('cellier.liste.par', { nom: who(item) })} · {relative(item.added_at, home.now)}</small>
           </div>
           <div class="qty" role="group" aria-label={t('cellier.liste.quantite', { nom: item.text })}>
@@ -169,6 +169,14 @@
   .what small {
     font-size: 12.5px;
     overflow-wrap: anywhere;
+  }
+
+  .what .chip {
+    margin-left: 6px;
+    padding: 1px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    vertical-align: 1px;
   }
 
   .qty {

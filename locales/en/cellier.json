@@ -22,6 +22,7 @@
   "cellier.liste.plus": "Increase the quantity of {nom}",
   "cellier.liste.retirer": "Remove {nom} from the list",
   "cellier.liste.retire": "Removed from the list: {nom}",
+  "cellier.liste.en_commande": "in an order",
   "cellier.panier.aucun": "No basket in progress. The agent proposes one as soon as it has read the prices.",
   "cellier.panier.propose_par": "Proposed by {nom}, {quand}",
   "cellier.panier.choisi_par": "Chosen option: {option}, by {nom}",

@@ -16,7 +16,7 @@ use crate::model::{
     ProviderSettings, Purchase, Reading,
 };
 use crate::providers::PROVIDERS;
-use crate::store::{PantryError, Store, confirm_offer_in, ms, now_ms, ts};
+use crate::store::{NOT_IN_A_CART, PantryError, Store, confirm_offer_in, ms, now_ms, ts};
 
 /// A price older than this (12 h, in ms) is "unknown", never used.
 const FRESH_MS: u64 = 43_200_000;
@@ -278,7 +278,8 @@ fn price_lines(
 }
 
 impl Store {
-    /// Prices the open list with the fresh readings (taken at `now − 12 h` or
+    /// Prices the open list (minus the lines already in a filled or ordered
+    /// cart) with the fresh readings (taken at `now − 12 h` or
     /// later) of the enabled drives, and stores the resulting options. The
     /// `deviations` are the agent's suggestions, minus those the household
     /// already refused twice for the same product and kind. Every previous
@@ -290,7 +291,7 @@ impl Store {
         deviations: Vec<Deviation>,
         now: u64,
     ) -> Result<Basket, PantryError> {
-        let items = self.open_items()?;
+        let items = self.items_to_buy()?;
         let products: HashMap<String, Product> = self
             .products()?
             .into_iter()
@@ -373,7 +374,8 @@ impl Store {
     }
 
     /// A human picks one of the options. The sheets it buys are confirmed (in
-    /// the chooser's name), the items it covers are tied to the basket, and
+    /// the chooser's name), the items it covers are tied to the basket (except
+    /// a line that meanwhile went into a filled or ordered cart), and
     /// each deviation not in `accepted` (indexes into `deviations`) counts one
     /// refusal for its product and kind.
     pub fn choose(
@@ -433,7 +435,7 @@ impl Store {
         }
         for item in choice.groups.values().flatten() {
             tx.execute(
-                "UPDATE items SET basket = ?1 WHERE id = ?2",
+                &format!("UPDATE items SET basket = ?1 WHERE id = ?2 AND {NOT_IN_A_CART}"),
                 params![basket, item],
             )?;
         }
@@ -535,8 +537,11 @@ impl Store {
         Ok(())
     }
 
-    /// At the pick-up: the provisional lines of a basket (what was ordered) are
-    /// replaced by the corrected ones (what was really bought), `confirmed`.
+    /// At the pick-up: the drive lines of a basket (what was ordered, and any
+    /// correction already made) are replaced by the corrected ones (what was
+    /// really bought), `confirmed` drive lines. Calling it again with the same
+    /// lines changes nothing; a receipt (`ticket`) line of the basket is left
+    /// alone.
     pub fn confirm_purchases(
         &self,
         basket: i64,
@@ -553,11 +558,14 @@ impl Store {
             return Err(PantryError::Invalid(format!("basket {basket} was dropped")));
         }
         tx.execute(
-            "DELETE FROM purchases WHERE basket = ?1 AND status = 'provisional'",
+            "DELETE FROM purchases WHERE basket = ?1 AND source = 'drive'",
             [basket],
         )?;
         for line in corrected {
+            // What the drive delivered: a drive line, whatever was sent, so a
+            // retry replaces it instead of adding to it.
             let line = Purchase {
+                source: "drive".into(),
                 status: "confirmed".into(),
                 ..line.clone()
             };
@@ -1236,6 +1244,184 @@ mod tests {
         store.propose("Sam", vec![], NOW + 3).unwrap();
         assert_eq!(state(second.id), "ordered");
         assert_eq!(state(third.id), "dropped");
+        cleanup(store, dir);
+    }
+
+    /// Every item a basket's options speak of, wherever they put it.
+    fn covered(basket: &Basket) -> BTreeSet<i64> {
+        let o = &basket.options;
+        o.singles
+            .iter()
+            .chain(o.split.iter())
+            .flat_map(|c| c.groups.values().flatten().chain(c.missing.iter()))
+            .chain(o.nowhere.iter())
+            .chain(o.elsewhere.iter())
+            .copied()
+            .collect()
+    }
+
+    fn tied_to(store: &Store, item: i64) -> Option<i64> {
+        store
+            .lock()
+            .query_row("SELECT basket FROM items WHERE id = ?1", [item], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// The basket chosen at carrefour, then moved up to `status`.
+    fn carried(store: &Store, status: BasketStatus) -> i64 {
+        let basket = store.propose("Sam", vec![], NOW).unwrap();
+        store.choose(basket.id, "carrefour", &[], "Sam").unwrap();
+        for next in [BasketStatus::Filled, BasketStatus::Ordered] {
+            store.set_status(basket.id, next, "Sam").unwrap();
+            if next == status {
+                break;
+            }
+        }
+        basket.id
+    }
+
+    #[test]
+    fn an_item_already_in_a_filled_or_ordered_basket_is_not_proposed_again() {
+        for status in [BasketStatus::Filled, BasketStatus::Ordered] {
+            let (store, dir, _, _, item) = two_drives(&format!("in-cart-{}", status.as_str()));
+            let first = carried(&store, status);
+            let bread = store.add_item("pain", None, 1.0, "Sam", "ui").unwrap();
+            let second = store.propose("Sam", vec![], NOW + 1).unwrap();
+            let lines = covered(&second);
+            assert!(!lines.contains(&item), "{status:?}: {lines:?}");
+            assert!(lines.contains(&bread.id), "{status:?}: {lines:?}");
+            assert_eq!(tied_to(&store, item), Some(first));
+            cleanup(store, dir);
+        }
+    }
+
+    #[test]
+    fn a_new_request_during_an_order_makes_a_new_line() {
+        let (store, dir, _, _, item) = two_drives("new-line");
+        let basket = carried(&store, BasketStatus::Ordered);
+        // Asked again while the first line is in the ordered cart: a new need.
+        let again = store
+            .add_item("lait", Some("lait"), 1.0, "Élodie", "ui")
+            .unwrap();
+        assert_ne!(again.id, item);
+        let open: Vec<i64> = store.open_items().unwrap().iter().map(|i| i.id).collect();
+        assert_eq!(open, vec![item, again.id]);
+        // The same goes for a free-text line.
+        let bread = store.add_item("Pain", None, 1.0, "Sam", "ui").unwrap();
+        store
+            .lock()
+            .execute(
+                "UPDATE items SET basket = ?1 WHERE id = ?2",
+                params![basket, bread.id],
+            )
+            .unwrap();
+        let bread_again = store.add_item("pain", None, 1.0, "Sam", "ui").unwrap();
+        assert_ne!(bread_again.id, bread.id);
+        // A third request joins the new line, which is in no cart.
+        let third = store
+            .add_item("lait", Some("lait"), 2.0, "Sam", "ui")
+            .unwrap();
+        assert_eq!(third.id, again.id);
+        assert!((third.qty - 3.0).abs() < f64::EPSILON);
+
+        // The pick-up closes only what the basket bought.
+        store
+            .record_purchases(&[purchase("lait", Some(basket), "provisional", 100)])
+            .unwrap();
+        store
+            .confirm_purchases(basket, &[purchase("lait", None, "confirmed", 100)])
+            .unwrap();
+        let open: Vec<i64> = store.open_items().unwrap().iter().map(|i| i.id).collect();
+        assert_eq!(open, vec![again.id, bread_again.id]);
+        cleanup(store, dir);
+    }
+
+    #[test]
+    fn choosing_never_takes_an_item_from_a_cart() {
+        let (store, dir, _, _, item) = two_drives("choose-guard");
+        let proposed = store.propose("Sam", vec![], NOW).unwrap();
+        assert!(covered(&proposed).contains(&item));
+        // Meanwhile the line went into a cart that is now ordered.
+        let ordered = {
+            let conn = store.lock();
+            conn.execute(
+                "INSERT INTO baskets(created_at, created_by, status, options, deviations, used)
+                 SELECT created_at, created_by, 'ordered', options, deviations, used
+                 FROM baskets WHERE id = ?1",
+                [proposed.id],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE items SET basket = ?1 WHERE id = ?2",
+                params![id, item],
+            )
+            .unwrap();
+            id
+        };
+        store.choose(proposed.id, "carrefour", &[], "Sam").unwrap();
+        assert_eq!(tied_to(&store, item), Some(ordered));
+        cleanup(store, dir);
+    }
+
+    #[test]
+    fn confirming_purchases_twice_keeps_the_corrected_lines_once() {
+        let (store, dir, _, _, _) = two_drives("confirm-twice");
+        let basket = carried(&store, BasketStatus::Ordered);
+        let mut ticket = purchase("piles", Some(basket), "confirmed", 450);
+        ticket.source = "ticket".into();
+        store
+            .record_purchases(&[
+                purchase("lait", Some(basket), "provisional", 100),
+                purchase("pain", Some(basket), "provisional", 120),
+                ticket.clone(),
+            ])
+            .unwrap();
+        let corrected = [
+            purchase("lait", None, "confirmed", 95),
+            purchase("pain", None, "confirmed", 120),
+        ];
+        store.confirm_purchases(basket, &corrected).unwrap();
+        // A retry (lost answer, second call) changes nothing.
+        store.confirm_purchases(basket, &corrected).unwrap();
+        let mut kept: Vec<(String, String, i64, String)> = store
+            .purchases(0, u64::MAX / 4)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.source, p.product, p.price_cents, p.status))
+            .collect();
+        kept.sort();
+        let line = |source: &str, product: &str, price: i64| {
+            (source.into(), product.into(), price, "confirmed".to_owned())
+        };
+        assert_eq!(
+            kept,
+            vec![
+                line("drive", "lait", 95),
+                line("drive", "pain", 120),
+                line("ticket", "piles", 450),
+            ]
+        );
+        // A second correction replaces the first one; what the drive delivered
+        // is a drive line even when sent as a receipt line, so it is replaced
+        // in turn.
+        let mut late = purchase("lait", None, "confirmed", 90);
+        late.source = "ticket".into();
+        for _ in 0..2 {
+            store
+                .confirm_purchases(basket, std::slice::from_ref(&late))
+                .unwrap();
+        }
+        let drive: Vec<(String, i64)> = store
+            .purchases(0, u64::MAX / 4)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.product == "lait")
+            .map(|p| (p.source, p.price_cents))
+            .collect();
+        assert_eq!(drive, vec![("drive".to_owned(), 90)]);
         cleanup(store, dir);
     }
 

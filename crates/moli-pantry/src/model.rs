@@ -70,6 +70,11 @@ pub struct Item {
     /// Where it came from: `ui`, `agent`, `telegram`…
     pub channel: String,
     pub added_at: u64,
+    /// The basket the line is tied to once an option buying it was chosen
+    /// (`None` otherwise). Tied to a `filled` or `ordered` basket, the line is
+    /// in a drive's cart.
+    #[serde(default)]
+    pub basket: Option<i64>,
 }
 
 /// Whether a human has checked that a store sheet is the right product.

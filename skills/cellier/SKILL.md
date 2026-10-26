@@ -54,17 +54,21 @@ relevés. Moli compare ; l'agent lit les vrais prix sur les sites, remplit les p
 - La connexion et les captchas se font **toujours par l'humain**, jamais par l'agent.
 - Une fiche par enseigne : lire l'adaptateur correspondant dans `adapters/` (`intermarche.md`,
   `carrefour.md`) avant de toucher au site. Une enseigne sans adaptateur ne se pilote pas.
+- Un adaptateur au statut brouillon sert à relever les prix en lecture seule : on ne touche ni au
+  panier ni au compte tant que sa limite de paiement n'est pas décrite et vérifiée.
 
-Chaque appel qui écrit prend `actor` (le nom de l'agent) et `on_behalf_of` (le prénom de la personne
-qui parle, s'il y en a une) : ils sont gardés avec ce qui est écrit.
+Les appels qui écrivent prennent `actor` (le nom de l'agent) et `on_behalf_of` (le prénom de la
+personne qui parle, s'il y en a une), gardés avec ce qui est écrit, sauf `pantry_save_product` et
+`pantry_record_purchases`, qui ne gardent aucun auteur et ne les prennent pas.
 
 ## Ajouter un article
 
 « Ajoute du lait aux courses » → `pantry_add_item` avec `text` (le besoin, dans les mots du foyer),
 `qty` si elle est dite, `product` si le besoin correspond à un produit connu de `pantry_overview`,
 et `on_behalf_of` = la personne qui parle. Redemander un besoin déjà ouvert en augmente la
-quantité : ne pas le vérifier soi-même, Moli s'en charge. Retirer : `pantry_remove_item` avec l'`id`
-de l'article.
+quantité (sauf si sa ligne est déjà dans un panier rempli ou commandé : la demande fait alors une
+nouvelle ligne) : ne pas le vérifier soi-même, Moli s'en charge. Retirer : `pantry_remove_item`
+avec l'`id` de l'article.
 
 ## Préparer les courses
 
@@ -96,11 +100,23 @@ de l'article.
    Moli : ne pas insister.
 6. **`pantry_propose_basket`** avec les écarts. Moli calcule une option par enseigne (`singles`), un
    panier réparti (`split`) et la recommandation (`options.recommended`), minimum de commande et frais
-   compris. Les articles sans prix frais nulle part sont à part (`nowhere`).
+   compris. Les articles sans prix frais nulle part sont à part (`nowhere`) ; ceux déjà dans un
+   panier rempli ou commandé ne sont pas repris.
 7. **Présenter dans la conversation** : pour chaque option le total, l'économie du panier recommandé
    (`saving_cents`, `saving_ratio`), les écarts expliqués et numérotés (leur index sert au choix), les
    articles introuvables, les fiches encore « à confirmer », et toute option invalide (minimum de
    commande non atteint). Puis attendre le choix de l'humain.
+
+## Où en est le panier
+
+Le tableau de bord fait les mêmes gestes que l'agent : l'humain a pu choisir l'option, marquer la
+commande payée ou les courses récupérées lui-même. **Avant de choisir, remplir ou enregistrer**,
+relire `pantry_overview` et le `status` du panier (`basket.status`), puis sauter les étapes déjà
+faites : déjà `chosen` → ne pas appeler `pantry_choose_option` ; déjà `filled` → ne pas remplir à
+nouveau ; déjà `ordered` → ne pas repasser le statut à `ordered` ; `done` ou plus de panier ouvert →
+seulement enregistrer les lignes corrigées si l'humain les donne. `pantry_overview` ne montre que le
+dernier panier ouvert : garder l'`id` du panier en cours, et chaque article dit dans `basket` le
+panier qui l'achète.
 
 ## Après le choix de l'humain
 
@@ -133,7 +149,8 @@ de l'article.
 1. Lire la facture ou le mail de fin de commande (ruptures, remplacements, poids réels), que
    l'humain montre ou ouvre lui-même.
 2. **`pantry_record_purchases`** avec `basket`, les lignes corrigées (`status: "confirmed"`) et
-   `confirm: true` : elles remplacent les lignes provisoires.
+   `confirm: true` : elles remplacent les lignes `drive` déjà enregistrées pour ce panier
+   (provisoires, ou une correction précédente). Renvoyer le même appel ne compte qu'une fois.
 
 ## Règles
 
@@ -147,3 +164,4 @@ de l'article.
 - **Naviguer au rythme d'un humain** : une page à la fois, pas de boucle rapide.
 - Ne jamais confirmer une fiche (seul un humain le fait dans le tableau de bord) ni essayer de passer
   un panier à `done`.
+- N'utiliser que les outils MCP `pantry_*`, jamais l'API REST du Cellier.

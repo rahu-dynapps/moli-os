@@ -22,6 +22,7 @@
   "cellier.liste.plus": "Augmenter la quantité de {nom}",
   "cellier.liste.retirer": "Retirer {nom} de la liste",
   "cellier.liste.retire": "Retiré de la liste : {nom}",
+  "cellier.liste.en_commande": "en commande",
   "cellier.panier.aucun": "Aucun panier en cours. L’agent en propose un dès qu’il a relevé les prix.",
   "cellier.panier.propose_par": "Proposé par {nom}, {quand}",
   "cellier.panier.choisi_par": "Option choisie : {option}, par {nom}",

@@ -309,7 +309,7 @@ struct PurchasesArgs {
     basket: Option<i64>,
     lines: Vec<Purchase>,
     /// False (default): record the lines. True: at the pick-up, replace the
-    /// basket's provisional lines by these corrected ones.
+    /// basket's drive lines (provisional or confirmed) by these corrected ones.
     #[serde(default)]
     confirm: bool,
 }
@@ -834,7 +834,7 @@ impl MoliMcp {
     }
 
     #[tool(
-        description = "Record what was bought, from an order confirmation (source `drive`, status `provisional`) or a receipt (source `ticket`, status `confirmed`). Amounts are unit prices in cents. With `confirm: true` (and the `basket`), at the pick-up, the basket's provisional lines are replaced by `lines`, the corrected ones. You record what a human paid; a basket is never paid by an agent. No author is recorded, so there is no `actor`."
+        description = "Record what was bought, from an order confirmation (source `drive`, status `provisional`) or a receipt (source `ticket`, status `confirmed`). Amounts are unit prices in cents. With `confirm: true` (and the `basket`), at the pick-up, the basket's drive lines (provisional, or already confirmed) are replaced by `lines`, the corrected ones: sending the same confirmation twice records it once. You record what a human paid; a basket is never paid by an agent. No author is recorded, so there is no `actor`."
     )]
     async fn pantry_record_purchases(
         &self,

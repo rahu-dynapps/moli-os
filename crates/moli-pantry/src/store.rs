@@ -112,13 +112,18 @@ CREATE TABLE IF NOT EXISTS purchases (
 );
 ";
 
-const ITEM_COLUMNS: &str = "id, product, text, qty, added_by, channel, added_at";
+const ITEM_COLUMNS: &str = "id, product, text, qty, added_by, channel, added_at, basket";
 const OFFER_COLUMNS: &str = "id, product, provider, reference, label, ean, unit_qty, unit, status";
 const SPLIT_THRESHOLD: &str = "split_threshold";
 const DEFAULT_SPLIT_THRESHOLD: f64 = 0.30;
 const SPLIT_RANGE: std::ops::RangeInclusive<f64> = 0.0..=0.9;
 /// An item is on the list while neither removed nor bought.
 const OPEN: &str = "removed_at IS NULL AND done_at IS NULL";
+/// An item not yet in a drive's cart: tied to no basket, or to one that is
+/// only proposed or chosen. A line in a `filled` or `ordered` basket is being
+/// bought: it is neither proposed again nor merged with a new request.
+pub(crate) const NOT_IN_A_CART: &str = "(basket IS NULL OR basket NOT IN \
+     (SELECT id FROM baskets WHERE status IN ('filled', 'ordered')))";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PantryError {
@@ -176,6 +181,7 @@ fn item_row(r: &Row<'_>) -> rusqlite::Result<Item> {
         added_by: r.get(4)?,
         channel: r.get(5)?,
         added_at: ms(r.get(6)?),
+        basket: r.get(7)?,
     })
 }
 
@@ -279,7 +285,9 @@ impl Store {
     /// Adds a need to the list. When the same need is already open (same
     /// product, or same words for a free-text line) its quantity grows and the
     /// first requester stays the author: two people asking for diapers at the
-    /// same time make one line.
+    /// same time make one line. A line already in a filled or ordered cart is
+    /// not that need any more: the new request makes a new line, so the
+    /// pick-up does not close it.
     pub fn add_item(
         &self,
         text: &str,
@@ -299,7 +307,10 @@ impl Store {
         let tx = conn.transaction()?;
         let existing: Option<i64> = if let Some(product) = product {
             tx.query_row(
-                &format!("SELECT id FROM items WHERE product = ?1 AND {OPEN} ORDER BY id LIMIT 1"),
+                &format!(
+                    "SELECT id FROM items WHERE product = ?1 AND {OPEN} AND {NOT_IN_A_CART}
+                     ORDER BY id LIMIT 1"
+                ),
                 [product],
                 |r| r.get(0),
             )
@@ -307,7 +318,8 @@ impl Store {
         } else {
             let wanted = same_words(text);
             let mut stmt = tx.prepare(&format!(
-                "SELECT id, text FROM items WHERE product IS NULL AND {OPEN} ORDER BY id"
+                "SELECT id, text FROM items WHERE product IS NULL AND {OPEN} AND {NOT_IN_A_CART}
+                 ORDER BY id"
             ))?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
             let mut found = None;
@@ -377,6 +389,18 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
             "SELECT {ITEM_COLUMNS} FROM items WHERE {OPEN} ORDER BY id"
+        ))?;
+        Ok(stmt
+            .query_map([], item_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The open lines a new basket may buy: those not already in a filled or
+    /// ordered cart, oldest first.
+    pub(crate) fn items_to_buy(&self) -> Result<Vec<Item>, PantryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items WHERE {OPEN} AND {NOT_IN_A_CART} ORDER BY id"
         ))?;
         Ok(stmt
             .query_map([], item_row)?
