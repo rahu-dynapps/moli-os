@@ -4,7 +4,7 @@
 //!
 //! The SQL lives here, as a second `impl Store` block, to keep `store.rs` small.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -12,7 +12,8 @@ use serde::de::DeserializeOwned;
 
 use crate::basket::{Choice, Line, Terms, compute};
 use crate::model::{
-    Basket, BasketStatus, Deviation, Offer, OfferStatus, Product, ProviderKind, Purchase, Reading,
+    Basket, BasketStatus, Deviation, Item, Offer, OfferStatus, Product, ProviderKind,
+    ProviderSettings, Purchase, Reading,
 };
 use crate::providers::PROVIDERS;
 use crate::store::{PantryError, Store, confirm_offer_in, ms, now_ms, ts};
@@ -237,12 +238,52 @@ impl<'a> Prices<'a> {
     }
 }
 
+/// One priced [`Line`] per open item, and which sheet priced each of them where.
+fn price_lines(
+    items: &[Item],
+    products: &HashMap<String, Product>,
+    drives: &[ProviderSettings],
+    prices: &Prices<'_>,
+) -> (Vec<Line>, Vec<Used>) {
+    let mut used: Vec<Used> = Vec::new();
+    let lines = items
+        .iter()
+        .map(|item| {
+            let product = item.product.as_deref().and_then(|id| products.get(id));
+            let mut line_prices = BTreeMap::new();
+            if let Some(id) = item.product.as_deref() {
+                for drive in drives {
+                    let found = prices.price(id, &drive.id, &drive.store);
+                    if let Some((offer, _)) = found {
+                        used.push((item.id, drive.id.clone(), offer));
+                    }
+                    line_prices.insert(drive.id.clone(), found.map(|(_, price)| price));
+                }
+            }
+            Line {
+                item: item.id,
+                product: item
+                    .product
+                    .as_deref()
+                    .map(|id| product.map_or(id, |p| p.name.as_str()))
+                    .unwrap_or_default()
+                    .to_owned(),
+                qty: item.qty,
+                fixed_provider: product.and_then(|p| p.fixed_provider.clone()),
+                prices: line_prices,
+            }
+        })
+        .collect();
+    (lines, used)
+}
+
 impl Store {
     /// Prices the open list with the fresh readings (taken at `now − 12 h` or
     /// later) of the enabled drives, and stores the resulting options. The
     /// `deviations` are the agent's suggestions, minus those the household
-    /// already refused twice for the same product and kind. A previous basket
-    /// still `Proposed` is dropped.
+    /// already refused twice for the same product and kind. Every previous
+    /// basket still `Proposed` or `Chosen` is dropped (its open items are freed);
+    /// a `Filled` or `Ordered` one is left alone, its carts already exist.
     pub fn propose(
         &self,
         by: &str,
@@ -280,35 +321,7 @@ impl Store {
             .collect();
 
         let prices = Prices::new(&offers, &readings);
-        let mut used: Vec<Used> = Vec::new();
-        let lines: Vec<Line> = items
-            .iter()
-            .map(|item| {
-                let product = item.product.as_deref().and_then(|id| products.get(id));
-                let mut line_prices = std::collections::BTreeMap::new();
-                if let Some(id) = item.product.as_deref() {
-                    for drive in &drives {
-                        let found = prices.price(id, &drive.id, &drive.store);
-                        if let Some((offer, _)) = found {
-                            used.push((item.id, drive.id.clone(), offer));
-                        }
-                        line_prices.insert(drive.id.clone(), found.map(|(_, price)| price));
-                    }
-                }
-                Line {
-                    item: item.id,
-                    product: item
-                        .product
-                        .as_deref()
-                        .map(|id| product.map_or(id, |p| p.name.as_str()))
-                        .unwrap_or_default()
-                        .to_owned(),
-                    qty: item.qty,
-                    fixed_provider: product.and_then(|p| p.fixed_provider.clone()),
-                    prices: line_prices,
-                }
-            })
-            .collect();
+        let (lines, used) = price_lines(&items, &products, &drives, &prices);
         let options = compute(&lines, &terms, threshold);
 
         let mut conn = self.lock();
@@ -327,12 +340,20 @@ impl Store {
                 kept.push(d);
             }
         }
+        let replaced = format!(
+            "SELECT id FROM baskets WHERE status IN ('{}', '{}')",
+            BasketStatus::Proposed.as_str(),
+            BasketStatus::Chosen.as_str()
+        );
         tx.execute(
-            "UPDATE baskets SET status = ?2 WHERE status = ?1",
-            params![
-                BasketStatus::Proposed.as_str(),
-                BasketStatus::Dropped.as_str()
-            ],
+            &format!(
+                "UPDATE items SET basket = NULL WHERE done_at IS NULL AND basket IN ({replaced})"
+            ),
+            [],
+        )?;
+        tx.execute(
+            &format!("UPDATE baskets SET status = ?1 WHERE id IN ({replaced})"),
+            [BasketStatus::Dropped.as_str()],
         )?;
         tx.execute(
             "INSERT INTO baskets(created_at, created_by, status, options, deviations, used)
@@ -416,8 +437,10 @@ impl Store {
                 params![basket, item],
             )?;
         }
+        // One refusal per distinct (product, kind) and call.
+        let mut counted: BTreeSet<(&str, &str)> = BTreeSet::new();
         for (i, d) in current.deviations.iter().enumerate() {
-            if !accepted.contains(&i) {
+            if !accepted.contains(&i) && counted.insert((d.product.as_str(), d.kind.as_str())) {
                 tx.execute(
                     "INSERT INTO refusals(product, kind, count) VALUES (?1, ?2, 1)
                      ON CONFLICT(product, kind) DO UPDATE SET count = count + 1",
@@ -1170,6 +1193,67 @@ mod tests {
         ));
         // Nothing of a refused batch is kept.
         assert_eq!(store.purchases(0, u64::MAX / 4).unwrap().len(), 2);
+        cleanup(store, dir);
+    }
+
+    #[test]
+    fn a_new_proposal_drops_the_chosen_basket_but_not_a_filled_one() {
+        let (store, dir, _, _, item) = two_drives("replace-chosen");
+        let first = store.propose("Sam", vec![], NOW).unwrap();
+        store.choose(first.id, "carrefour", &[], "Sam").unwrap();
+        let second = store.propose("Sam", vec![], NOW + 1).unwrap();
+        let state = |id: i64| {
+            store
+                .lock()
+                .query_row("SELECT status FROM baskets WHERE id = ?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        let tied = || -> Option<i64> {
+            store
+                .lock()
+                .query_row("SELECT basket FROM items WHERE id = ?1", [item], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(state(first.id), "dropped");
+        assert_eq!(tied(), None);
+        assert_eq!(state(second.id), "proposed");
+
+        // A basket already filled (or ordered) has real carts: it stays.
+        store.choose(second.id, "carrefour", &[], "Sam").unwrap();
+        store
+            .set_status(second.id, BasketStatus::Filled, "Sam")
+            .unwrap();
+        let third = store.propose("Sam", vec![], NOW + 2).unwrap();
+        assert_eq!(state(second.id), "filled");
+        assert_eq!(tied(), Some(second.id));
+        store
+            .set_status(second.id, BasketStatus::Ordered, "Sam")
+            .unwrap();
+        store.propose("Sam", vec![], NOW + 3).unwrap();
+        assert_eq!(state(second.id), "ordered");
+        assert_eq!(state(third.id), "dropped");
+        cleanup(store, dir);
+    }
+
+    #[test]
+    fn a_repeated_deviation_counts_one_refusal_per_choice() {
+        let (store, dir, _, _, _) = two_drives("refusal-once");
+        let twice = vec![deviation("x", "own_brand"), deviation("x", "own_brand")];
+        let basket = store.propose("Sam", twice, NOW).unwrap();
+        store.choose(basket.id, "carrefour", &[], "Sam").unwrap();
+        let count: i64 = store
+            .lock()
+            .query_row(
+                "SELECT count FROM refusals WHERE product = 'x' AND kind = 'own_brand'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
         cleanup(store, dir);
     }
 }
