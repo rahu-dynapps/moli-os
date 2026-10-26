@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::model::{Flexibility, Item, Product};
+use crate::model::{Flexibility, Item, Offer, OfferStatus, Product, ProviderSettings, Reading};
+use crate::providers::PROVIDERS;
 
 /// The whole V1 schema, created at once: the offers, readings, baskets and
 /// purchases tables are filled by later features, but exist from day one so no
@@ -22,7 +23,8 @@ CREATE TABLE IF NOT EXISTS products (
     fixed_provider TEXT,
     aisle          TEXT
 );
--- One sheet per (product, drive); 'pending' until a human confirms it.
+-- Several candidate sheets per (product, provider), at most one 'confirmed'; a sheet
+-- stays 'pending' until a human confirms it.
 CREATE TABLE IF NOT EXISTS offers (
     id           INTEGER PRIMARY KEY,
     product      TEXT NOT NULL,
@@ -35,7 +37,7 @@ CREATE TABLE IF NOT EXISTS offers (
     status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed')),
     confirmed_by TEXT,
     confirmed_at INTEGER,
-    UNIQUE (product, provider)
+    UNIQUE (product, provider, reference)
 );
 CREATE TABLE IF NOT EXISTS items (
     id         INTEGER PRIMARY KEY,
@@ -58,7 +60,7 @@ CREATE TABLE IF NOT EXISTS readings (
     store            TEXT NOT NULL,
     price_cents      INTEGER NOT NULL,
     unit_price_cents INTEGER,
-    promo            INTEGER NOT NULL DEFAULT 0,
+    promo            TEXT,
     available        INTEGER NOT NULL DEFAULT 1,
     read_at          INTEGER NOT NULL,
     read_by          TEXT NOT NULL
@@ -110,6 +112,10 @@ CREATE TABLE IF NOT EXISTS purchases (
 ";
 
 const ITEM_COLUMNS: &str = "id, product, text, qty, added_by, channel, added_at";
+const OFFER_COLUMNS: &str = "id, product, provider, reference, label, ean, unit_qty, unit, status";
+const SPLIT_THRESHOLD: &str = "split_threshold";
+const DEFAULT_SPLIT_THRESHOLD: f64 = 0.30;
+const SPLIT_RANGE: std::ops::RangeInclusive<f64> = 0.0..=0.9;
 /// An item is on the list while neither removed nor bought.
 const OPEN: &str = "removed_at IS NULL AND done_at IS NULL";
 
@@ -178,6 +184,34 @@ fn product_row(r: &Row<'_>) -> rusqlite::Result<Product> {
         flexibility: Flexibility::parse(&flexibility).unwrap_or_default(),
         fixed_provider: r.get(4)?,
         aisle: r.get(5)?,
+    })
+}
+
+fn offer_row(r: &Row<'_>) -> rusqlite::Result<Offer> {
+    let status: String = r.get(8)?;
+    Ok(Offer {
+        id: r.get(0)?,
+        product: r.get(1)?,
+        provider: r.get(2)?,
+        reference: r.get(3)?,
+        label: r.get(4)?,
+        ean: r.get(5)?,
+        unit_qty: r.get(6)?,
+        unit: r.get(7)?,
+        status: OfferStatus::parse(&status).unwrap_or_default(),
+    })
+}
+
+fn reading_row(r: &Row<'_>) -> rusqlite::Result<Reading> {
+    Ok(Reading {
+        offer: r.get(0)?,
+        store: r.get(1)?,
+        price_cents: r.get(2)?,
+        unit_price_cents: r.get(3)?,
+        promo: r.get(4)?,
+        available: r.get(5)?,
+        read_at: ms(r.get(6)?),
+        read_by: r.get(7)?,
     })
 }
 
@@ -354,6 +388,218 @@ impl Store {
         Ok(stmt
             .query_map([], product_row)?
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Creates a sheet, or updates the one with the same product, chain and
+    /// reference. A new sheet starts `Pending` and an update keeps the current
+    /// status (the `status` field is ignored): only [`Store::confirm_offer`]
+    /// confirms, so a human check can never be skipped or silently undone.
+    pub fn save_offer(&self, o: &Offer) -> Result<i64, PantryError> {
+        if o.product.trim().is_empty()
+            || o.provider.trim().is_empty()
+            || o.reference.trim().is_empty()
+        {
+            return Err(PantryError::Invalid(
+                "an offer needs a product, a provider and a reference".into(),
+            ));
+        }
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "INSERT INTO offers(product, provider, reference, label, ean, unit_qty, unit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(product, provider, reference) DO UPDATE SET label = excluded.label,
+                 ean = excluded.ean, unit_qty = excluded.unit_qty, unit = excluded.unit
+             RETURNING id",
+            params![
+                o.product,
+                o.provider,
+                o.reference,
+                o.label,
+                o.ean,
+                o.unit_qty,
+                o.unit
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A human validates a sheet: it becomes `Confirmed` and the other sheets
+    /// of the same product in the same chain go back to `Pending`.
+    pub fn confirm_offer(&self, id: i64, by: &str) -> Result<(), PantryError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let key: Option<(String, String)> = tx
+            .query_row(
+                "SELECT product, provider FROM offers WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((product, provider)) = key else {
+            return Err(PantryError::NotFound(format!("offer {id}")));
+        };
+        tx.execute(
+            "UPDATE offers SET status = 'pending', confirmed_by = NULL, confirmed_at = NULL
+             WHERE product = ?1 AND provider = ?2 AND id <> ?3",
+            params![product, provider, id],
+        )?;
+        tx.execute(
+            "UPDATE offers SET status = 'confirmed', confirmed_by = ?2, confirmed_at = ?3
+             WHERE id = ?1",
+            params![id, by, ts(now_ms())],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The sheets, of one product or of all, oldest first.
+    pub fn offers(&self, product: Option<&str>) -> Result<Vec<Offer>, PantryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {OFFER_COLUMNS} FROM offers WHERE ?1 IS NULL OR product = ?1 ORDER BY id"
+        ))?;
+        Ok(stmt
+            .query_map([product], offer_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Stores price readings, all or none: an unknown sheet or a negative price
+    /// refuses the whole batch.
+    pub fn record_readings(&self, readings: &[Reading]) -> Result<(), PantryError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for r in readings {
+            if r.price_cents < 0 || r.unit_price_cents.is_some_and(|p| p < 0) {
+                return Err(PantryError::Invalid("a price cannot be negative".into()));
+            }
+            let known: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM offers WHERE id = ?1)",
+                [r.offer],
+                |row| row.get(0),
+            )?;
+            if !known {
+                return Err(PantryError::NotFound(format!("offer {}", r.offer)));
+            }
+            tx.execute(
+                "INSERT INTO readings(offer, store, price_cents, unit_price_cents, promo,
+                                      available, read_at, read_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    r.offer,
+                    r.store,
+                    r.price_cents,
+                    r.unit_price_cents,
+                    r.promo,
+                    r.available,
+                    ts(r.read_at),
+                    r.read_by
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The most recent reading of each sheet in each store, kept only when it
+    /// was taken at `newer_than` or later (ms): a store whose latest price is
+    /// too old yields nothing, never an even older price.
+    pub fn latest_readings(&self, newer_than: u64) -> Result<Vec<Reading>, PantryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT r.offer, r.store, r.price_cents, r.unit_price_cents, r.promo, r.available,
+                    r.read_at, r.read_by
+             FROM readings r
+             WHERE r.read_at >= ?1
+               AND r.id = (SELECT id FROM readings
+                           WHERE offer = r.offer AND store = r.store
+                           ORDER BY read_at DESC, id DESC LIMIT 1)
+             ORDER BY r.offer, r.store",
+        )?;
+        Ok(stmt
+            .query_map([ts(newer_than)], reading_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// One line per known chain, in the order of [`PROVIDERS`]; a chain nobody
+    /// has set up yet is disabled.
+    pub fn provider_settings(&self) -> Result<Vec<ProviderSettings>, PantryError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT enabled, store, min_order_cents, fee_cents FROM providers WHERE id = ?1",
+        )?;
+        PROVIDERS
+            .iter()
+            .map(|p| {
+                let saved = stmt
+                    .query_row([p.id], |r| {
+                        Ok(ProviderSettings {
+                            id: p.id.into(),
+                            enabled: r.get(0)?,
+                            store: r.get(1)?,
+                            min_order_cents: r.get(2)?,
+                            fee_cents: r.get(3)?,
+                        })
+                    })
+                    .optional()?;
+                Ok(saved.unwrap_or_else(|| ProviderSettings {
+                    id: p.id.into(),
+                    enabled: false,
+                    store: String::new(),
+                    min_order_cents: 0,
+                    fee_cents: 0,
+                }))
+            })
+            .collect()
+    }
+
+    pub fn save_provider_settings(&self, s: &ProviderSettings) -> Result<(), PantryError> {
+        if !PROVIDERS.iter().any(|p| p.id == s.id) {
+            return Err(PantryError::Invalid(format!("unknown provider: {}", s.id)));
+        }
+        if s.min_order_cents < 0 || s.fee_cents < 0 {
+            return Err(PantryError::Invalid(
+                "the minimum order and the fee cannot be negative".into(),
+            ));
+        }
+        self.lock().execute(
+            "INSERT INTO providers(id, enabled, store, min_order_cents, fee_cents)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, store = excluded.store,
+                 min_order_cents = excluded.min_order_cents, fee_cents = excluded.fee_cents",
+            params![s.id, s.enabled, s.store, s.min_order_cents, s.fee_cents],
+        )?;
+        Ok(())
+    }
+
+    /// How much cheaper (0.30 = 30 %) a split of the list over two drives must
+    /// be than the best single drive before it is recommended.
+    pub fn split_threshold(&self) -> Result<f64, PantryError> {
+        let saved: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [SPLIT_THRESHOLD],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(saved
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| SPLIT_RANGE.contains(v))
+            .unwrap_or(DEFAULT_SPLIT_THRESHOLD))
+    }
+
+    pub fn set_split_threshold(&self, v: f64) -> Result<(), PantryError> {
+        if !SPLIT_RANGE.contains(&v) {
+            return Err(PantryError::Invalid(
+                "the threshold must be between 0 and 0.9".into(),
+            ));
+        }
+        self.lock().execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SPLIT_THRESHOLD, v.to_string()],
+        )?;
+        Ok(())
     }
 }
 
@@ -548,6 +794,250 @@ mod tests {
         drop(store);
         let again = Store::open(&path).unwrap();
         assert_eq!(again.open_items().unwrap().len(), 1);
+        drop(again);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn offer(product: &str, provider: &str, reference: &str) -> Offer {
+        Offer {
+            product: product.into(),
+            provider: provider.into(),
+            reference: reference.into(),
+            label: format!("{product} {reference}"),
+            ..Offer::default()
+        }
+    }
+
+    fn reading(offer: i64, price_cents: i64, read_at: u64) -> Reading {
+        Reading {
+            offer,
+            store: "Ville-A".into(),
+            price_cents,
+            unit_price_cents: None,
+            promo: None,
+            available: true,
+            read_at,
+            read_by: "Élodie".into(),
+        }
+    }
+
+    #[test]
+    fn confirming_an_offer_unconfirms_its_rivals() {
+        let (store, dir) = store("confirm");
+        let first = store
+            .save_offer(&offer("couches", "carrefour", "A1"))
+            .unwrap();
+        let second = store
+            .save_offer(&offer("couches", "carrefour", "B2"))
+            .unwrap();
+        // Another chain's sheet for the same product is not a rival.
+        let other = store
+            .save_offer(&offer("couches", "intermarche", "C3"))
+            .unwrap();
+        store.confirm_offer(other, "Sam").unwrap();
+        store.confirm_offer(first, "Élodie").unwrap();
+        store.confirm_offer(second, "Sam").unwrap();
+        let status = |id: i64| {
+            store
+                .offers(Some("couches"))
+                .unwrap()
+                .into_iter()
+                .find(|o| o.id == id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status(first), OfferStatus::Pending);
+        assert_eq!(status(second), OfferStatus::Confirmed);
+        assert_eq!(status(other), OfferStatus::Confirmed);
+        assert!(matches!(
+            store.confirm_offer(999, "Sam"),
+            Err(PantryError::NotFound(_))
+        ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saving_an_offer_again_updates_it_in_place() {
+        let (store, dir) = store("offer-upsert");
+        let mut o = offer("lait", "carrefour", "L1");
+        let id = store.save_offer(&o).unwrap();
+        store.confirm_offer(id, "Sam").unwrap();
+        o.label = "Lait 1 L".into();
+        o.ean = Some("3000000000000".into());
+        o.unit_qty = Some(1.0);
+        o.unit = Some("L".into());
+        assert_eq!(store.save_offer(&o).unwrap(), id);
+        let all = store.offers(None).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].label, "Lait 1 L");
+        assert_eq!(all[0].ean.as_deref(), Some("3000000000000"));
+        assert_eq!(all[0].unit_qty, Some(1.0));
+        // An update never unconfirms a sheet a human validated.
+        assert_eq!(all[0].status, OfferStatus::Confirmed);
+        // Another reference of the same product and chain is a new candidate.
+        let other = store.save_offer(&offer("lait", "carrefour", "L2")).unwrap();
+        assert_ne!(other, id);
+        assert_eq!(store.offers(Some("lait")).unwrap().len(), 2);
+        assert!(store.offers(Some("riz")).unwrap().is_empty());
+        assert!(matches!(
+            store.save_offer(&offer("", "carrefour", "L3")),
+            Err(PantryError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.save_offer(&offer("lait", "carrefour", " ")),
+            Err(PantryError::Invalid(_))
+        ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn latest_reading_wins_and_old_ones_are_ignored() {
+        let (store, dir) = store("readings");
+        let id = store
+            .save_offer(&offer("couches", "carrefour", "A1"))
+            .unwrap();
+        store
+            .record_readings(&[reading(id, 1_000, 1_000), reading(id, 1_200, 2_000)])
+            .unwrap();
+        let got = store.latest_readings(0).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].price_cents, 1_200);
+        assert_eq!(got[0].read_at, 2_000);
+        assert!(store.latest_readings(3_000).unwrap().is_empty());
+        // The older reading never comes back once the newest is the one kept.
+        assert_eq!(store.latest_readings(1_500).unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn readings_are_kept_per_offer_and_store() {
+        let (store, dir) = store("readings-store");
+        let a = store
+            .save_offer(&offer("couches", "carrefour", "A1"))
+            .unwrap();
+        let b = store
+            .save_offer(&offer("couches", "intermarche", "B1"))
+            .unwrap();
+        let mut elsewhere = reading(a, 1_100, 1_500);
+        elsewhere.store = "Ville-B".into();
+        elsewhere.promo = Some("2 pour 1".into());
+        elsewhere.unit_price_cents = Some(25);
+        elsewhere.available = false;
+        store
+            .record_readings(&[
+                reading(a, 1_000, 1_000),
+                elsewhere.clone(),
+                reading(b, 900, 1_000),
+            ])
+            .unwrap();
+        let got = store.latest_readings(0).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got.contains(&elsewhere));
+        assert!(got.contains(&reading(b, 900, 1_000)));
+        // A reading of an unknown sheet, or with a negative price, is refused
+        // and nothing of the batch is kept.
+        assert!(matches!(
+            store.record_readings(&[reading(a, 1, 9_000), reading(999, 1, 9_000)]),
+            Err(PantryError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.record_readings(&[reading(a, -1, 9_000)]),
+            Err(PantryError::Invalid(_))
+        ));
+        assert!(store.latest_readings(9_000).unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn provider_settings_list_every_chain_disabled_until_set() {
+        let (store, dir) = store("providers");
+        let all = store.provider_settings().unwrap();
+        assert_eq!(all.len(), PROVIDERS.len());
+        assert!(all.iter().all(|s| !s.enabled && s.store.is_empty()));
+        assert!(all.iter().zip(PROVIDERS).all(|(s, p)| s.id == p.id));
+        let set = ProviderSettings {
+            id: "carrefour".into(),
+            enabled: true,
+            store: "Ville-A".into(),
+            min_order_cents: 3_000,
+            fee_cents: 499,
+        };
+        store.save_provider_settings(&set).unwrap();
+        let all = store.provider_settings().unwrap();
+        assert_eq!(all.iter().find(|s| s.id == "carrefour"), Some(&set));
+        assert_eq!(all.iter().filter(|s| s.enabled).count(), 1);
+        // Saving again replaces.
+        let off = ProviderSettings {
+            enabled: false,
+            ..set
+        };
+        store.save_provider_settings(&off).unwrap();
+        assert!(
+            store
+                .provider_settings()
+                .unwrap()
+                .iter()
+                .all(|s| !s.enabled)
+        );
+        let negative = ProviderSettings {
+            fee_cents: -1,
+            ..off
+        };
+        assert!(matches!(
+            store.save_provider_settings(&negative),
+            Err(PantryError::Invalid(_))
+        ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unknown_provider_is_refused() {
+        let (store, dir) = store("unknown-provider");
+        let s = ProviderSettings {
+            id: "nulle-part".into(),
+            enabled: true,
+            store: "Ville-A".into(),
+            min_order_cents: 0,
+            fee_cents: 0,
+        };
+        assert!(matches!(
+            store.save_provider_settings(&s),
+            Err(PantryError::Invalid(_))
+        ));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn threshold_defaults_to_thirty_percent() {
+        let (store, dir) = store("threshold");
+        assert!((store.split_threshold().unwrap() - 0.30).abs() < f64::EPSILON);
+        assert!(matches!(
+            store.set_split_threshold(0.95),
+            Err(PantryError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.set_split_threshold(-0.1),
+            Err(PantryError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.set_split_threshold(f64::NAN),
+            Err(PantryError::Invalid(_))
+        ));
+        assert!((store.split_threshold().unwrap() - 0.30).abs() < f64::EPSILON);
+        store.set_split_threshold(0.5).unwrap();
+        store.set_split_threshold(0.0).unwrap();
+        assert!(store.split_threshold().unwrap().abs() < f64::EPSILON);
+        store.set_split_threshold(0.9).unwrap();
+        let path = dir.join("pantry.db");
+        drop(store);
+        let again = Store::open(&path).unwrap();
+        assert!((again.split_threshold().unwrap() - 0.9).abs() < f64::EPSILON);
         drop(again);
         let _ = std::fs::remove_dir_all(dir);
     }

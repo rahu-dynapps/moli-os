@@ -7,7 +7,12 @@
 //! storage and the pure logic; it opens nothing until the host asks for it.
 
 mod model;
+mod providers;
 mod store;
 
-pub use model::{Flexibility, Item, Product};
+pub use model::{
+    Flexibility, Item, Offer, OfferStatus, Product, ProviderInfo, ProviderKind, ProviderSettings,
+    Reading,
+};
+pub use providers::PROVIDERS;
 pub use store::{PantryError, Store};
