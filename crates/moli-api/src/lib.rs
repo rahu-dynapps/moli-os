@@ -3,6 +3,7 @@
 //! - `/api/*`    REST (snapshot, commands, labels, journal, approvals, health)
 //! - `/api/energy` consumption and cost (headline figures, series)
 //! - `/api/weather` the forecast and the clouds seen from space
+//! - `/api/cellier` the pantry: shopping list, products, price comparison
 //! - `/api/assistant` Moli, the conversation that acts and picks what to show
 //! - `/api/automations` automations (graphs), their runs and Moli's drafts
 //! - `/api/events` server-sent events: a snapshot, then every change
@@ -24,6 +25,7 @@ mod integrations;
 mod limit;
 mod machines;
 mod mcp;
+mod pantry;
 mod people;
 mod people_api;
 mod whereabouts;
@@ -126,6 +128,8 @@ pub struct Options {
     /// The sky over the house (forecast, satellite), when its position is
     /// known.
     pub weather: Option<moli_weather::Weather>,
+    /// The household's pantry (« Le Cellier »), when `[pantry]` is configured.
+    pub pantry: Option<moli_pantry::Pantry>,
 }
 
 /// Builds the complete HTTP application. Live streams end when `shutdown`
@@ -167,6 +171,7 @@ fn house_routes(humans: &Arc<session::Sessions>, options: &Options) -> Router<Hu
         .map(|dir| dir.join("infra.json"));
     Router::new()
         .merge(weather::routes(options.weather.clone()))
+        .merge(pantry::routes(options.pantry.clone()))
         .route("/api/infra", get(rest::infra))
         .layer(Extension(rest::InfraFile(infra)))
         .route("/api/plan", get(plan::get).put(plan::put))

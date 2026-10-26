@@ -1117,6 +1117,7 @@ dependencies = [
  "moli-host",
  "moli-i18n",
  "moli-net",
+ "moli-pantry",
  "moli-phones",
  "moli-runtime",
  "moli-weather",

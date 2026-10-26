@@ -100,3 +100,6 @@ base_topic = "zigbee2mqtt"
 # local_speech = "127.0.0.1:10200"              # Piper (Wyoming), repli de la voix ; "" = aucun
 # local_voice = "fr_FR-siwis-medium"
 # local_listen = "127.0.0.1:10300"              # Whisper (Wyoming), repli de l'écoute ; "" = aucun
+
+# Le Cellier : la liste de courses du foyer et la comparaison des drives (dormant sans cette section).
+# [pantry]

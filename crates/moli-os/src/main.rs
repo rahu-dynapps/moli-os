@@ -330,9 +330,8 @@ async fn serve(config: Config, boot: Instant) -> anyhow::Result<()> {
     let (history, recorder) = start_history(&config, &hub, &cancel)?.unzip();
     // Energy too: a reading missed is energy filed in the wrong hour.
     let (energy, metering) = start_energy(&config, &hub, &cancel)?.unzip();
-    // Opened at start, so a broken database shows in the log at once; no
-    // surface serves it yet.
-    let _pantry = pantry(&config, &hub);
+    // Opened at start, so a broken database shows in the log at once.
+    let pantry = pantry(&config, &hub);
 
     let (mut tasks, gates) = spawn_drivers(&config, &hub, &cancel)?;
     tasks.extend(spawn_house_drivers(&config, &hub, energy.as_ref(), &cancel));
@@ -373,6 +372,7 @@ async fn serve(config: Config, boot: Instant) -> anyhow::Result<()> {
         phones: gates.phones,
         machines: gates.machines,
         weather: weather(&config),
+        pantry,
     };
     // Client addresses matter: human sessions are bound to them.
     axum::serve(
