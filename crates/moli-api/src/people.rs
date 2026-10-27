@@ -14,9 +14,11 @@
 //!   commands its rooms only, until it expires: nothing of the rest of the
 //!   house, nobody's whereabouts).
 //! - Signing in: Cloudflare Access's verified e-mail names the person who has
-//!   it (no password then); otherwise a password, from anywhere (a session
-//!   bound to the person, not to an address: a phone changes address); a new
-//!   person sets theirs with an invitation code.
+//!   it (no password then), behind `[server.access]` only: without Access an
+//!   e-mail opens nothing, and an owner who has only an e-mail does not count
+//!   as an owner who can sign in; otherwise a password, from anywhere (a
+//!   session bound to the person, not to an address: a phone changes
+//!   address); a new person sets theirs with an invitation code.
 //! - The e-mails of `[server.access] owners` become owners at the first start:
 //!   a house that had owners keeps them, nothing to do.
 
@@ -541,6 +543,21 @@ impl People {
     /// Whether Cloudflare Access fronts the house (`[server.access]`).
     pub(crate) fn set_behind_access(&self, yes: bool) {
         self.behind_access.store(yes, Ordering::Relaxed);
+    }
+
+    /// The active owners who have an e-mail but no password: without Access,
+    /// none of them can sign in, so the house's code manages the people.
+    pub(crate) fn email_only_owners(&self) -> usize {
+        lock(&self.book)
+            .people
+            .iter()
+            .filter(|p| {
+                p.role == Role::Owner
+                    && active(p)
+                    && !p.emails.is_empty()
+                    && self.hub.core_secret(&password_key(&p.id)).is_none()
+            })
+            .count()
     }
 
     fn reference(p: &Person) -> PersonRef {
@@ -1097,6 +1114,7 @@ mod tests {
         d.emails = vec!["a@example.org".into()];
         let a = p.create(d).await.unwrap();
         assert!(!p.has_owner(), "the house's code may still invite them");
+        assert_eq!(p.email_only_owners(), 1);
         p.set_behind_access(true);
         assert!(p.has_owner(), "Access vouches for the e-mail");
         p.set_behind_access(false);
